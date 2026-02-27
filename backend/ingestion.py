@@ -10,7 +10,7 @@ from langchain_core.documents import Document
 # Suppress warnings
 warnings.filterwarnings("ignore")
 
-# Configuration
+# Configuration for Render Cloud Deployment
 COLLECTION_NAME = "local_documents"
 
 from langchain_community.document_loaders import PDFPlumberLoader, TextLoader, Docx2txtLoader
@@ -122,7 +122,8 @@ def ingest_file(file_path: str, folder_name: str = "default", progress_callback=
         return {"error": msg}
 
     full_text_preview = " ".join([d.page_content[:100] for d in docs[:3]])
-    print(f"--- [INGEST] Text Preview: {full_text_preview.replace('\\n', ' ')}... ---")
+    preview_clean = full_text_preview.replace("\n", " ")
+    print(f"--- [INGEST] Text Preview: {preview_clean}... ---")
     
     # 1.5 Add Metadata
     for doc in docs:
@@ -131,14 +132,19 @@ def ingest_file(file_path: str, folder_name: str = "default", progress_callback=
     
     # 2. Split
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=100
+        chunk_size=2000,
+        chunk_overlap=200
     )
     splits = text_splitter.split_documents(docs)
     print(f"--- [INGEST] Split into {len(splits)} chunks ---")
     
-    # 3. Embeddings
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    # 3. Embeddings (Choose based on env to save memory on Render)
+    if os.getenv("OPENAI_API_KEY"):
+        from langchain_openai import OpenAIEmbeddings
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    else:
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
     
     # Use Singleton Client
     client = get_qdrant_client()

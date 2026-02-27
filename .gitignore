@@ -6,8 +6,9 @@ env/
 ENV/
 
 # Databases
-qdrant_db/
-qdrant_storage/
+# qdrant_db/
+# qdrant_storage/
+backend/qdrant_db/
 
 # Python
 __pycache__/

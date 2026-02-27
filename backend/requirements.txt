@@ -12,3 +12,6 @@ onnxruntime
 rapidocr-onnxruntime
 pillow
 pydantic>=2.0
+langchain-openai
+langchain-qdrant
+langchain-huggingface

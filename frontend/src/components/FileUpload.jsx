@@ -49,7 +49,7 @@ const FileUpload = ({ onUploadSuccess, activeFolder }) => {
                     return;
                 }
                 try {
-                    const res = await axios.get(`http://127.0.0.1:8001/upload-status/${jobId}`);
+                    const res = await axios.get(`http://127.0.0.1:8000/upload-status/${jobId}`);
                     if (res.data && res.data.status === 'processing') {
                         setOcrProgress({
                             current: res.data.current_page,
@@ -68,7 +68,7 @@ const FileUpload = ({ onUploadSuccess, activeFolder }) => {
             }, 1000);
 
             try {
-                const response = await axios.post('http://127.0.0.1:8001/upload/', formData, {
+                const response = await axios.post('http://127.0.0.1:8000/upload/', formData, {
                     headers: { 'Content-Type': 'multipart/form-data' },
                     onUploadProgress: (progressEvent) => {
                         const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);

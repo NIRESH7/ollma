@@ -15,7 +15,7 @@ function App() {
     const fetchCount = async () => {
         setIsRefreshing(true);
         try {
-            const res = await axios.get('http://127.0.0.1:8001/debug/collection/');
+            const res = await axios.get('http://127.0.0.1:8000/debug/collection/');
             setPointCount(res.data.point_count);
         } catch {
             console.error("Failed to fetch point count");

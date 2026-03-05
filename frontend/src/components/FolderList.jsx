@@ -9,7 +9,7 @@ const FolderList = ({ activeFolder, onSelectFolder, onViewFiles, onDeleteFolder 
 
     const fetchFolders = async () => {
         try {
-            const res = await axios.get('http://127.0.0.1:8001/folders');
+            const res = await axios.get('http://127.0.0.1:8000/folders');
             setFolders(res.data.folders);
         } catch (error) {
             console.error("Failed to fetch folders", error);
@@ -21,7 +21,7 @@ const FolderList = ({ activeFolder, onSelectFolder, onViewFiles, onDeleteFolder 
         if (!newFolderName.trim()) return;
 
         try {
-            await axios.post('http://127.0.0.1:8001/folders', { folder_name: newFolderName });
+            await axios.post('http://127.0.0.1:8000/folders', { folder_name: newFolderName });
             setNewFolderName("");
             setIsCreating(false);
             fetchFolders();
@@ -35,7 +35,7 @@ const FolderList = ({ activeFolder, onSelectFolder, onViewFiles, onDeleteFolder 
         if (!window.confirm(`Are you sure you want to delete "${folderName}" and all its contents?`)) return;
 
         try {
-            await axios.delete(`http://127.0.0.1:8001/folders/${folderName}`);
+            await axios.delete(`http://127.0.0.1:8000/folders/${folderName}`);
             if (activeFolder === folderName) onSelectFolder("All");
             fetchFolders();
             if (onDeleteFolder) onDeleteFolder(folderName);

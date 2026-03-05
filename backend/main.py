@@ -29,7 +29,7 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 async def get_api_key(header_api_key: str = Depends(api_key_header), request: Request = None):
     # Allow local requests without API key for development convenience
-    is_local = request.client.host in ("127.0.0.1", "localhost") if request and request.client else False
+    is_local = request.client.host in ("127.0.0.1", "localhost", "::1") if request and request.client else False
     
     if is_local or header_api_key == API_KEY:
         return header_api_key

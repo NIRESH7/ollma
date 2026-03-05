@@ -91,10 +91,10 @@ def ingest_file(file_path: str, folder_name: str = "default", progress_callback=
         print(f"--- [INGEST] ERROR: File not found at {file_path} ---")
         return {"error": "File not found"}
 
-    # ── Route Excel files to the dedicated Excel ingestion module ──
+    # ── Route Tabular files (Excel/CSV) to the dedicated engine ──
     ext = os.path.splitext(file_path)[1].lower()
-    if ext in (".xlsx", ".xls"):
-        print(f"--- [INGEST] Routing to Excel ingestion module for: {file_path} ---")
+    if ext in (".xlsx", ".xls", ".csv"):
+        print(f"--- [INGEST] Routing to Tabular ingestion module for: {file_path} ---")
         return ingest_excel_file(file_path, folder_name, progress_callback)
 
     docs = []
@@ -137,10 +137,11 @@ def ingest_file(file_path: str, folder_name: str = "default", progress_callback=
         doc.metadata["folder"] = folder_name
         doc.metadata["ocr_processed"] = used_ocr
     
-    # 2. Split
+    # 2. Split with semantic separators
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=2000,
-        chunk_overlap=200
+        chunk_size=1000,
+        chunk_overlap=150,
+        separators=["\n\n", "\n", ". ", " ", ""]
     )
     splits = text_splitter.split_documents(docs)
     print(f"--- [INGEST] Split into {len(splits)} chunks ---", flush=True)

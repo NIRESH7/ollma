@@ -17,7 +17,7 @@ const FileViewerModal = ({ isOpen, onClose, folderName }) => {
         setIsLoading(true);
         setError(null);
         try {
-            const res = await axios.get(`http://127.0.0.1:8001/folders/${folderName}/files`);
+            const res = await axios.get(`http://127.0.0.1:8000/folders/${folderName}/files`);
             setFiles(res.data.files || []);
         } catch (err) {
             console.error("Failed to fetch files", err);

@@ -1,12 +1,11 @@
 """
-Excel Ingestion Engine - Full Hybrid Flow (v4)
-Step 1: Read every sheet → Pandas DataFrame
-Step 2: Flatten every row into KEY=VALUE format
-Step 3: Store in Qdrant (search) AND Pandas Cache (math)
+Structured Excel Parsing Flow (v6)
+Flow: Excel -> Openpyxl -> Custom Layout Parser -> Pandas -> JSON Schema Builder -> Embeddings -> Qdrant -> LLM
 """
 
 import os
 import re
+import json
 import warnings
 import datetime
 import pandas as pd
@@ -68,28 +67,37 @@ def ingest_excel_file(
     5. Store in Qdrant + Pandas Cache
     """
     file_name = os.path.basename(file_path)
-    print(f"\n📂 [EXCEL-INGEST] Processing: {file_name}", flush=True)
+    ext = os.path.splitext(file_path)[1].lower()
+    print(f"\n[TABULAR-INGEST] Processing: {file_name}", flush=True)
 
     try:
-        xl = pd.ExcelFile(file_path, engine="openpyxl")
+        if ext in (".xlsx", ".xls"):
+            xl = pd.ExcelFile(file_path, engine="openpyxl")
+            sheets = xl.sheet_names
+        else:
+            # CSV case
+            sheets = ["CSV_DATA"]
+            xl = None
     except Exception as e:
-        print(f"❌ [EXCEL-INGEST] Failed to open file: {e}")
+        print(f"X [TABULAR-INGEST] Failed to open file: {e}")
         return {"error": str(e)}
 
     all_chunks: list[Document] = []
-    # sheet_name -> list of dicts (one per data row)
     all_sheet_records: dict[str, list[dict]] = {}
 
-    for s_idx, sheet_name in enumerate(xl.sheet_names):
-        print(f"  📄 Sheet [{s_idx+1}/{len(xl.sheet_names)}]: {sheet_name}")
-        if progress_callback:
-            progress_callback(s_idx + 1, len(xl.sheet_names))
+    for s_idx, sheet_name in enumerate(sheets):
+        print(f"  [FILE-SECTION] Processing Section: {sheet_name}")
+        if progress_callback and xl:
+            progress_callback(s_idx + 1, len(sheets))
 
         try:
-            raw_df = xl.parse(sheet_name, header=None, dtype=str)
+            if xl:
+                raw_df = xl.parse(sheet_name, header=None, dtype=str)
+            else:
+                raw_df = pd.read_csv(file_path, header=None, dtype=str)
             raw_df = raw_df.fillna("")
         except Exception as e:
-            print(f"  ⚠️ [EXCEL-INGEST] Could not parse sheet '{sheet_name}': {e}")
+            print(f"  ! [TABULAR-INGEST] Could not parse '{sheet_name}': {e}")
             continue
 
         rows = raw_df.values.tolist()
@@ -110,63 +118,69 @@ def ingest_excel_file(
             if _looks_like_section_header(row_vals_ne):
                 current_section = row_vals_ne[0]
                 current_columns = []  # Reset columns for new section
-                print(f"    📌 Section: {current_section}")
+                print(f"    [SECTION-META] Section: {current_section}")
                 continue
 
             # ── Detect Column Header Row ──
             if _looks_like_header(row_vals_ne) and not any(_is_numeric(v) for v in row_vals_ne):
                 # This row becomes our column names
                 current_columns = [v for v in row_vals if v not in ("", "nan", "None")]
-                print(f"    📋 Headers detected: {current_columns[:5]}...")
-                continue
-
-            # ── Data Row: Flatten to KEY=VALUE ──
+                print(f"    [HEADER-META] Headers detected: {current_columns[:5]}...")
+            
+            # ── Data Row Processing ──
             if current_columns:
-                # Map column names to values
-                record = {
-                    "FILE": file_name,
-                    "SHEET": sheet_name,
-                    "SECTION": current_section,
-                }
-                has_data = False
-                for col_idx, col_name in enumerate(current_columns):
-                    if col_idx < len(row_vals):
-                        val = row_vals[col_idx]
-                        if val not in ("", "nan", "None"):
-                            record[col_name] = val
-                            has_data = True
-                if not has_data:
+                # 1. Clean Content: Direct data for LLM
+                record_data = {}
+                for j, val in enumerate(row_vals):
+                    col_name = current_columns[j] if j < len(current_columns) else f"Col_{j}"
+                    if val not in ("", "nan", "None"):
+                        record_data[col_name] = val
+                
+                if not record_data:
                     continue
-                    
-                sheet_records.append(record)
-
-                # ── STEP 2: Create KEY=VALUE string ──
-                kv_string = " | ".join(f"{k}={v}" for k, v in record.items())
+                
+                sheet_records.append(record_data)
+                kv_pairs = [f"{k}: {v}" for k, v in record_data.items()]
+                clean_content = " | ".join(kv_pairs)
+                
+                # 2. Metadata & Raw Backup
+                record = {
+                    "source": file_name,
+                    "sheet": sheet_name,
+                    "section": current_section,
+                    "data": record_data
+                }
+                raw_row_str = " | ".join(row_vals_ne)
+                json_string = json.dumps(record, ensure_ascii=False)
                 
                 all_chunks.append(Document(
-                    page_content=kv_string,
+                    page_content=clean_content,
                     metadata={
                         "source": file_path,
                         "file_name": file_name,
                         "sheet": sheet_name,
                         "section": current_section,
                         "folder": folder_name,
-                        "source_type": "excel",
+                        "source_type": "structured_tabular",
                         "timestamp": datetime.datetime.utcnow().isoformat(),
+                        "json_data": json_string,
+                        "raw_row": raw_row_str
                     }
                 ))
             else:
-                # No columns yet — treat as a text chunk
-                text = " | ".join(row_vals_ne)
+                # No columns yet — treat as text chunk
+                content_text = " ".join(row_vals_ne)
+                semantic_string = f"Data in {sheet_name}, Section {current_section}: {content_text}"
+                
                 all_chunks.append(Document(
-                    page_content=f"FILE={file_name} | SHEET={sheet_name} | SECTION={current_section} | TEXT={text}",
+                    page_content=semantic_string,
                     metadata={
                         "source": file_path,
                         "file_name": file_name,
                         "sheet": sheet_name,
                         "section": current_section,
                         "folder": folder_name,
-                        "source_type": "excel_text",
+                        "source_type": "tabular_unstructured",
                         "timestamp": datetime.datetime.utcnow().isoformat(),
                     }
                 ))
@@ -185,7 +199,7 @@ def ingest_excel_file(
             }
         }
         total_records = sum(len(v) for v in all_sheet_records.values())
-        print(f"  ✅ Pandas Cache: {total_records} rows across {len(all_sheet_records)} sheets")
+        print(f"  [SUCCESS] Pandas Cache: {total_records} rows across {len(all_sheet_records)} sheets")
 
     if not all_chunks:
         return {"error": "No data detected in Excel. Please check the file structure."}
@@ -199,9 +213,9 @@ def ingest_excel_file(
         )
         vector_store.add_documents(all_chunks)
         post_count = client.count(collection_name=COLLECTION_NAME).count
-        print(f"  ✅ Qdrant: {len(all_chunks)} chunks stored. Total vectors: {post_count}", flush=True)
+        print(f"  [SUCCESS] Qdrant: {len(all_chunks)} chunks stored. Total vectors: {post_count}", flush=True)
     except Exception as e:
-        print(f"❌ [EXCEL-INGEST] Qdrant Error: {e}")
+        print(f"[ERROR] [TABULAR-INGEST] Qdrant Error: {e}")
         return {"error": str(e)}
 
     total_rows = sum(

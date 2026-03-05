@@ -16,10 +16,11 @@ from langchain_qdrant import QdrantVectorStore
 from qdrant_client.http import models
 from database import get_qdrant_client
 from excel_query import is_numeric_question, run_dataframe_query
+from langchain_core.documents import Document
 
 # ── Configuration ──────────────────────────────────────────────────
 COLLECTION_NAME = "local_documents"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:mini")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # ── Model Singletons (loaded once at startup) ──────────────────────
@@ -28,9 +29,10 @@ embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 llm = Ollama(
     model=OLLAMA_MODEL,
     temperature=0,
-    num_predict=128,
-    top_p=0.5,
+    num_predict=64,
+    top_p=0.1,
     repeat_penalty=1.1,
+    stop=["USER QUESTION:", "DATABASE RECORDS:", "\n\n"]
 )
 print("--- [RAG] Ready ---")
 
@@ -60,10 +62,10 @@ JSON ONLY:"""
         if "```json" in raw: raw = raw.split("```json")[1].split("```")[0].strip()
         elif "```" in raw: raw = raw.split("```")[1].split("```")[0].strip()
         data = json.loads(raw)
-        # Ensure consistency
-        if "UPC" in str(data.get("attributes", [])) or "UPC" in str(data.get("synonyms", [])):
+        # Ensure consistency and expand industry synonyms
+        if any(term in str(data.get("attributes", [])) + str(data.get("synonyms", [])) for term in ["UPC", "GSTIN", "GTIN", "Article"]):
             if "synonyms" not in data: data["synonyms"] = []
-            data["synonyms"].extend(["GTIN", "ArticleCode", "UPC", "Article Description Code"])
+            data["synonyms"].extend(["GTIN", "ArticleCode", "UPC", "GSTIN", "EAN", "Barcode", "Item Code", "Article Description Code"])
         return data
     except Exception as e:
         print(f"  ⚠️ [QUERY-ANALYSIS] Error: {e}. Falling back.")
@@ -103,10 +105,21 @@ def _hybrid_retrieve(question: str, analysis: dict, folder_name: str = None) -> 
     product_name = analysis.get("product", "")
     search_terms = analysis.get("search_terms", [])
     
-    # Combine product words and attributes
+    # Combine product words, attributes and synonyms
     filter_tokens = set(search_terms)
     if product_name:
         filter_tokens.update(product_name.split()[:3])
+    
+    # Add synonyms and attributes to filter tokens for better lexical coverage
+    def _collect_tokens(items):
+        if isinstance(items, str):
+            filter_tokens.update(items.split())
+        elif isinstance(items, list):
+            for item in items:
+                _collect_tokens(item)
+
+    _collect_tokens(analysis.get("synonyms", []))
+    _collect_tokens(analysis.get("attributes", []))
     
     filter_tokens = [t for t in filter_tokens if len(t) > 2] # ignore tiny words
 
@@ -148,39 +161,36 @@ def _post_filter(docs: list, keywords: list[str]) -> list:
         return docs
 
     numeric_kw = [k for k in keywords if any(c.isdigit() for c in k)]
-    text_kw = [k for k in keywords if not any(c.isdigit() for c in k)]
-
-    filtered = []
-    seen_content = set()
-
+    # Post-filter: Check for numeric exact matches
+    perfect_numeric_matches = []
+    other_matches = []
+    
     for doc in docs:
-        content_norm = _normalize(doc.page_content)
-        if content_norm in seen_content: continue
-        
-        section_norm = _normalize(doc.metadata.get("section", ""))
-        combined = content_norm + " " + section_norm
-
-        # Numeric keywords (like 38g) must appear closely (handling units)
         numeric_hit = True
+        # Check both the content and the raw_row metadata for numbers
+        search_text = (doc.page_content + " " + doc.metadata.get("raw_row", "")).lower()
+        
         for nk in numeric_kw:
-            base_num = re.sub(r'[^\d]', '', nk)
-            if base_num and base_num not in combined:
+            target_num = re.sub(r'[^\d.]', '', nk).rstrip('0').rstrip('.')
+            if not target_num: continue
+            
+            # Boundary-aware numeric check in the search text
+            content_nums = re.findall(r'\b\d+\.?\d*\b', search_text)
+            normalized_content_nums = [n.rstrip('0').rstrip('.') for n in content_nums]
+            
+            if target_num not in normalized_content_nums:
                 numeric_hit = False
                 break
         
-        if not numeric_hit:
-            continue
+        if numeric_hit:
+            perfect_numeric_matches.append(doc)
+        else:
+            other_matches.append(doc)
 
-        # For text keywords, we check if at least some appear
-        hit_count = sum(1 for k in text_kw if k in combined)
-        if text_kw and hit_count == 0:
-            continue
-
-        filtered.append(doc)
-        seen_content.add(content_norm)
-
-    print(f"[HYBRID-FILTER] Retained {len(filtered)} high-quality docs.", flush=True)
-    return filtered if filtered else docs[:3]
+    print(f"[HYBRID-FILTER] Perfect Numeric Matches: {len(perfect_numeric_matches)} | Others: {len(other_matches)}", flush=True)
+    
+    # Return perfect matches if found, otherwise fallback to others
+    return perfect_numeric_matches if perfect_numeric_matches else other_matches[:3]
 
 
 # ── STEP 6: LLM Answer Generator ──────────────────────────────────
@@ -200,21 +210,15 @@ def _generate_answer(question: str, filtered_docs: list) -> str:
 
     context = "\n".join(context_lines)
 
-    prompt = f"""You are a precise DATA-ONLY extraction bot.
-    
-STRICT RULES:
-1. Answer the question using ONLY the provided DATA below.
-2. If the answer is not explicitly written in the DATA, say exactly: "Not found in data."
-3. DO NOT use your own knowledge. Never assume or guess.
-4. If you find multiple matches, list them clearly.
-5. If the product name doesn't match EXACTLY as written in data, say: "Not found in data."
+    prompt = f"""Use the DATABASE RECORDS to answer the USER QUESTION.
+Provide ONLY the exact value requested. Do not repeat the question.
 
-DATA SECTIONS:
+DATABASE RECORDS:
 {context}
 
 USER QUESTION: {question}
 
-FINAL ANSWER (ONE SENTENCE MAX OR "Not found in data."):"""
+ANSWER:"""
 
     print(f"--- [LLM] Sending {len(context_lines)} rows to model ---", flush=True)
     t = time.time()

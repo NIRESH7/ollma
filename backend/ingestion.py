@@ -6,6 +6,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from database import get_qdrant_client
 from langchain_core.documents import Document
+from excel_ingestion import ingest_excel_file
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -85,10 +86,16 @@ def extract_text_with_ocr(file_path, progress_callback=None):
         return []
 
 def ingest_file(file_path: str, folder_name: str = "default", progress_callback=None):
-    print(f"--- [INGEST] Starting ingestion for: {file_path} in folder: {folder_name} ---")
+    print(f"--- [INGEST] Starting ingestion for: {file_path} in folder: {folder_name} ---", flush=True)
     if not os.path.exists(file_path):
         print(f"--- [INGEST] ERROR: File not found at {file_path} ---")
         return {"error": "File not found"}
+
+    # ── Route Excel files to the dedicated Excel ingestion module ──
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in (".xlsx", ".xls"):
+        print(f"--- [INGEST] Routing to Excel ingestion module for: {file_path} ---")
+        return ingest_excel_file(file_path, folder_name, progress_callback)
 
     docs = []
     used_ocr = False
@@ -136,7 +143,7 @@ def ingest_file(file_path: str, folder_name: str = "default", progress_callback=
         chunk_overlap=200
     )
     splits = text_splitter.split_documents(docs)
-    print(f"--- [INGEST] Split into {len(splits)} chunks ---")
+    print(f"--- [INGEST] Split into {len(splits)} chunks ---", flush=True)
     
     # 3. Embeddings (Choose based on env to save memory on Render)
     if os.getenv("OPENAI_API_KEY"):
@@ -162,7 +169,7 @@ def ingest_file(file_path: str, folder_name: str = "default", progress_callback=
         collection_name=COLLECTION_NAME,
     )
     
-    print(f"--- [INGEST] Adding {len(splits)} documents to Qdrant ---")
+    print(f"--- [INGEST] Adding {len(splits)} documents to Qdrant ---", flush=True)
     qdrant.add_documents(splits)
     
     # Check post-ingest count
@@ -173,7 +180,7 @@ def ingest_file(file_path: str, folder_name: str = "default", progress_callback=
     
     status_msg = "Ingested (OCR)" if used_ocr else "Ingested"
 
-    print(f"--- [INGEST] Success! Documents added to Qdrant. ---")
+    print(f"--- [INGEST] Success! Documents added to Qdrant. ---", flush=True)
     
     return {
         "num_chunks": len(splits), 

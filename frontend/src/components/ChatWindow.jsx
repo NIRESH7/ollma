@@ -28,7 +28,7 @@ const ChatWindow = ({ activeFolder }) => {
         setIsLoading(true);
 
         try {
-            const response = await axios.post('http://127.0.0.1:8000/query/', {
+            const response = await axios.post('http://127.0.0.1:8001/query/', {
                 question: input,
                 folder: activeFolder || "All"
             });

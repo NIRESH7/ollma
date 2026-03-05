@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import axios from 'axios';
-import { Upload, FileText, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+import { Upload, FileText, CheckCircle, AlertCircle, Loader2, Table2 } from 'lucide-react';
 
 const FileUpload = ({ onUploadSuccess, activeFolder }) => {
     const [status, setStatus] = useState('idle'); // idle, uploading, success, error, partial
@@ -8,6 +8,8 @@ const FileUpload = ({ onUploadSuccess, activeFolder }) => {
     const [details, setDetails] = useState([]);
     const [progress, setProgress] = useState(0);
     const [ocrProgress, setOcrProgress] = useState(null); // { current, total, percent }
+    const [isExcelUpload, setIsExcelUpload] = useState(false);
+    const [sheetInfo, setSheetInfo] = useState([]); // For Excel sheet metadata
     const pollIntervalRef = useRef(null);
 
     // Cleanup on unmount
@@ -21,10 +23,13 @@ const FileUpload = ({ onUploadSuccess, activeFolder }) => {
         if (e.target.files && e.target.files.length > 0) {
             const selectedFiles = Array.from(e.target.files);
             const jobId = `session_job_${Date.now()}`;
+            const isExcel = selectedFiles.some(f => /\.(xlsx|xls)$/i.test(f.name));
+            setIsExcelUpload(isExcel);
             setStatus('uploading');
             setMessage(`Uploading ${selectedFiles.length} file(s)...`);
             setProgress(0);
             setOcrProgress(null);
+            setSheetInfo([]);
             setDetails([]);
 
             const formData = new FormData();
@@ -44,31 +49,32 @@ const FileUpload = ({ onUploadSuccess, activeFolder }) => {
                     return;
                 }
                 try {
-                    const res = await axios.get(`http://127.0.0.1:8000/upload-status/${jobId}`);
+                    const res = await axios.get(`http://127.0.0.1:8001/upload-status/${jobId}`);
                     if (res.data && res.data.status === 'processing') {
                         setOcrProgress({
                             current: res.data.current_page,
                             total: res.data.total_pages,
                             percent: res.data.progress
                         });
-                        setMessage(`OCR Processing: Page ${res.data.current_page}/${res.data.total_pages} (${res.data.progress}%)`);
+                        setMessage(isExcelUpload
+                            ? `Processing Excel: ${res.data.progress}% complete...`
+                            : `OCR Processing: Page ${res.data.current_page}/${res.data.total_pages} (${res.data.progress}%)`);
                     } else if (res.data.status === 'completed' || res.data.error) {
                         if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
                     }
                 } catch (err) {
                     console.error("Polling error:", err);
-                    // On network error, don't necessarily stop, but eventually the safety count will kill it
                 }
             }, 1000);
 
             try {
-                const response = await axios.post('http://127.0.0.1:8000/upload/', formData, {
+                const response = await axios.post('http://127.0.0.1:8001/upload/', formData, {
                     headers: { 'Content-Type': 'multipart/form-data' },
                     onUploadProgress: (progressEvent) => {
                         const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
                         setProgress(percentCompleted);
                         if (percentCompleted === 100) {
-                            setMessage("Upload complete. Waiting for OCR extraction...");
+                            setMessage("Upload complete. Processing file...");
                         }
                     }
                 });
@@ -76,6 +82,20 @@ const FileUpload = ({ onUploadSuccess, activeFolder }) => {
                 const results = response.data.results;
                 const failures = results.filter(r => r.status === 'failed' || r.status === 'error');
                 const successes = results.filter(r => r.status === 'success');
+
+                // Extract Excel sheet info from successful results
+                const allSheetInfo = [];
+                successes.forEach(r => {
+                    if (r.details?.sheet_info && r.details.sheet_info.length > 0) {
+                        allSheetInfo.push({
+                            file: r.filename,
+                            sheets: r.details.sheet_info,
+                            total_rows: r.details.total_rows,
+                            sheets_count: r.details.sheets_count,
+                        });
+                    }
+                });
+                setSheetInfo(allSheetInfo);
 
                 if (failures.length === 0) {
                     setStatus('success');
@@ -89,7 +109,6 @@ const FileUpload = ({ onUploadSuccess, activeFolder }) => {
                 }
 
                 setDetails(results);
-
                 if (successes.length > 0 && onUploadSuccess) onUploadSuccess();
 
             } catch (error) {
@@ -108,6 +127,7 @@ const FileUpload = ({ onUploadSuccess, activeFolder }) => {
             <input
                 type="file"
                 multiple
+                accept=".pdf,.docx,.txt,.xlsx,.xls"
                 onChange={handleFileChange}
                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
                 disabled={status === 'uploading'}
@@ -131,7 +151,7 @@ const FileUpload = ({ onUploadSuccess, activeFolder }) => {
                         {status === 'uploading' ? 'Ingestion Active' : 'Import Documents'}
                     </p>
                     <p className="text-[9px] text-slate-500 mt-0.5 font-bold tracking-[0.1em] opacity-80 uppercase">
-                        {status === 'uploading' ? 'Neural Ingestion Active' : 'Neural Ingestion Protocol'}
+                        {status === 'uploading' ? 'Neural Ingestion Active' : 'PDF · DOCX · TXT · XLSX · XLS'}
                     </p>
                 </div>
 
@@ -160,19 +180,46 @@ const FileUpload = ({ onUploadSuccess, activeFolder }) => {
                         </div>
                     </div>
 
+                    {/* Excel Sheet Info Panel */}
+                    {sheetInfo.length > 0 && (
+                        <div className="mb-3 space-y-2 border-t border-white/10 pt-3">
+                            {sheetInfo.map((info, idx) => (
+                                <div key={idx} className="p-2.5 rounded-xl bg-indigo-500/5 border border-indigo-500/15">
+                                    <div className="flex items-center gap-2 mb-1.5">
+                                        <Table2 className="w-3 h-3 text-indigo-500" />
+                                        <p className="text-[9px] font-black text-indigo-700 uppercase tracking-widest truncate">{info.file}</p>
+                                    </div>
+                                    <p className="text-[9px] text-slate-500 font-bold mb-1">
+                                        {info.sheets_count} sheet{info.sheets_count > 1 ? 's' : ''} · {info.total_rows?.toLocaleString()} rows ingested
+                                    </p>
+                                    <div className="flex flex-wrap gap-1 mt-1">
+                                        {info.sheets.map((s, si) => (
+                                            <span key={si} className="px-2 py-0.5 rounded-full bg-indigo-100/60 text-indigo-700 text-[8px] font-black border border-indigo-200/50">
+                                                {s.sheet} ({s.rows} rows)
+                                            </span>
+                                        ))}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
                     {details.length > 0 && (
                         <div className="space-y-1.5 max-h-32 overflow-y-auto custom-scrollbar pr-2 border-t border-white/5 pt-3">
                             {details.map((res, idx) => (
                                 <div key={idx} className="flex items-center gap-2 text-[9px] py-1.5 px-2.5 rounded-lg bg-white/5 border border-white/5">
                                     <div className={`w-1.5 h-1.5 rounded-full ${res.status === 'success' ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]' : 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.5)]'}`}></div>
                                     <span className="text-slate-700 font-bold truncate flex-1">{res.filename}</span>
+                                    {res.details?.status === 'Ingested (Excel)' && (
+                                        <span className="text-indigo-500 font-black text-[8px] uppercase">XLSX</span>
+                                    )}
                                 </div>
                             ))}
                         </div>
                     )}
 
                     <button
-                        onClick={() => setStatus('idle')}
+                        onClick={() => { setStatus('idle'); setSheetInfo([]); }}
                         className="w-full mt-4 py-2.5 bg-indigo-600/10 hover:bg-indigo-600/20 text-indigo-700 text-[10px] font-black uppercase tracking-[0.2em] rounded-lg transition-all border border-indigo-600/20 active:scale-95"
                     >
                         Acknowledge
@@ -180,9 +227,6 @@ const FileUpload = ({ onUploadSuccess, activeFolder }) => {
                 </div>
             )}
         </div>
-
-
-
     );
 };
 

@@ -20,3 +20,15 @@ def get_qdrant_client():
             print(f"--- [DB] Initializing QdrantClient with local path: {QDRANT_PATH} ---")
             _client_instance = QdrantClient(path=QDRANT_PATH)
     return _client_instance
+
+def close_qdrant_client():
+    global _client_instance
+    if _client_instance is not None:
+        try:
+            _client_instance.close()
+            print("--- [DB] QdrantClient closed and lock released ---", flush=True)
+        except Exception as e:
+            print(f"--- [DB] Error closing QdrantClient: {e} ---", flush=True)
+        finally:
+            _client_instance = None
+

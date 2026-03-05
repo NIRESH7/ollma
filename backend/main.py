@@ -17,7 +17,7 @@ from fastapi import Form
 from ingestion import ingest_file
 from rag import query_rag
 
-from database import get_qdrant_client
+from database import get_qdrant_client, close_qdrant_client
 from qdrant_client.http import models
 
 app = FastAPI(title="Local RAG API")
@@ -48,7 +48,7 @@ async def log_requests(request: Request, call_next):
     print(f"--- [DEBUG] INCOMING REQUEST: {request.method} {request.url.path} ---")
     response = await call_next(request)
     process_time = time.time() - start_time
-    print(f"--- [DEBUG] COMPLETED REQUEST: {request.method} {request.url.path} | STATUS: {response.status_code} | TIME: {process_time:.4f}s ---")
+    print(f"--- [DEBUG] COMPLETED REQUEST: {request.method} {request.url.path} | STATUS: {response.status_code} | TIME: {process_time:.4f}s ---", flush=True)
     return response
 
 # Configuration matching other files
@@ -84,13 +84,24 @@ def startup_event():
     except Exception as e:
         print(f"--- [STARTUP] Error checking/creating collection: {e} ---")
 
+@app.on_event("shutdown")
+def shutdown_event():
+    print("--- [SHUTDOWN] Releasing Qdrant lock... ---", flush=True)
+    close_qdrant_client()
 
 
 # CORS Setup
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False, # Changed to False for compatibility with "*"
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -213,7 +224,7 @@ def upload_file(
     folder: str = Form("default"),
     job_id: str = Form(None)
 ):
-    print(f"--- [API] Received Upload Request for {len(files)} files in folder: {folder} (Job: {job_id}) ---")
+    print(f"--- [API] Received Upload Request for {len(files)} files in folder: {folder} (Job: {job_id}) ---", flush=True)
     
     if job_id:
         upload_stats[job_id] = {"status": "processing", "progress": 0, "total_pages": 0, "current_page": 0}
@@ -252,7 +263,7 @@ def upload_file(
                 error = ingest_result["error"]
                 print(f"--- [API] Error ingesting {file.filename}: {error} ---")
             else:
-                print(f"--- [API] Successfully ingested {file.filename} ---")
+                print(f"--- [API] Successfully ingested {file.filename} ---", flush=True)
                 
             results.append({
                 "filename": file.filename,
@@ -322,5 +333,5 @@ def debug_collection():
         return {"error": str(e)}
 
 if __name__ == "__main__":
-    import uvicorn
+    print("\n🚀 [SERVER] NeuralRAG Backend starting on http://0.0.0.0:8000", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=8000)

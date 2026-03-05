@@ -218,9 +218,14 @@ def ingest_excel_file(
         print(f"[ERROR] [TABULAR-INGEST] Qdrant Error: {e}")
         return {"error": str(e)}
 
-    total_rows = sum(
-        len(df) for f in EXCEL_CACHE.values() for df in f["sheets"].values()
-    )
+    # ── Final Summary Log ──
+    total_rows = sum(len(recs) for recs in all_sheet_records.values())
+    print(f"\n📊 [EXCEL-INGESTED] Migration Summary for {file_name}:")
+    print(f"   • Total Sheets Processed: {len(all_sheet_records)}")
+    for sn, recs in all_sheet_records.items():
+        print(f"   • Sheet '{sn}': {len(recs)} data rows identified.")
+    print(f"   • Total AI Chunks Created: {len(all_chunks)}\n")
+
     return {
         "status": "Success",
         "num_chunks": len(all_chunks),

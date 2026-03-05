@@ -18,3 +18,4 @@ langchain-huggingface
 pandas
 openpyxl
 xlrd
+docx2txt

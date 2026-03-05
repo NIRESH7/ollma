@@ -29,7 +29,10 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
 async def get_api_key(header_api_key: str = Depends(api_key_header), request: Request = None):
     # Allow local requests without API key for development convenience
-    is_local = request.client.host in ("127.0.0.1", "localhost", "::1") if request and request.client else False
+    client_host = request.client.host if request and request.client else ""
+    local_hosts = ("127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1")
+    
+    is_local = client_host in local_hosts
     
     if is_local or header_api_key == API_KEY:
         return header_api_key
@@ -116,7 +119,8 @@ from fastapi import Form
 
 # ... existing code ...
 
-FOLDERS_FILE = "folders.json"
+FOLDERS_FILE = os.path.join("data", "folders.json")
+os.makedirs("data", exist_ok=True)
 
 def get_folders():
     if not os.path.exists(FOLDERS_FILE):

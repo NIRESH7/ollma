@@ -128,9 +128,15 @@ def ingest_file(file_path: str, folder_name: str = "default", progress_callback=
         print(f"--- [INGEST] FAILURE: {msg} ---")
         return {"error": msg}
 
-    full_text_preview = " ".join([d.page_content[:100] for d in docs[:3]])
-    preview_clean = full_text_preview.replace("\n", " ")
-    print(f"--- [INGEST] Text Preview: {preview_clean}... ---")
+    # ── Extraction Summary ──
+    total_chars = sum(len(d.page_content) for d in docs)
+    print(f"\n📄 [EXTRACTED] Summary for: {os.path.basename(file_path)}")
+    print(f"   • Total Pages/Segments: {len(docs)}")
+    print(f"   • Total Characters: {total_chars:,}")
+    
+    if docs:
+        preview = docs[0].page_content[:200].replace("\n", " ").strip()
+        print(f"   • Text Preview: \"{preview}...\"\n")
     
     # 1.5 Add Metadata
     for doc in docs:
@@ -144,7 +150,7 @@ def ingest_file(file_path: str, folder_name: str = "default", progress_callback=
         separators=["\n\n", "\n", ". ", " ", ""]
     )
     splits = text_splitter.split_documents(docs)
-    print(f"--- [INGEST] Split into {len(splits)} chunks ---", flush=True)
+    print(f"--- [INGEST] Split into {len(splits)} chunks for Vector Search ---", flush=True)
     
     # 3. Embeddings (Choose based on env to save memory on Render)
     if os.getenv("OPENAI_API_KEY"):

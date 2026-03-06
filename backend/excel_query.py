@@ -1,7 +1,7 @@
 """
-Excel Hybrid Query Engine (v6 - Helper Module)
+Excel Hybrid Query Engine (v7 - Helper Module)
 Provides helper functions for numeric checks and basic row lookups.
-The main query logic now resides in rag.py.
+Updated to support the new v7 Deterministic Cache format.
 """
 
 import re
@@ -26,8 +26,8 @@ except ImportError:
 
 def run_dataframe_query(question: str, folder_name: str = "All") -> Optional[str]:
     """
-    Simplified Pandas query for flat tables in EXCEL_CACHE.
-    Main context-aware queries are handled by rag.py.
+    Simplified Numeric Engine for EXCEL_CACHE.
+    Supports both legacy DataFrames and new v7 Structured JSON.
     """
     if not EXCEL_CACHE:
         return None
@@ -37,24 +37,52 @@ def run_dataframe_query(question: str, folder_name: str = "All") -> Optional[str
         if folder_name != "All" and entry.get("folder") != folder_name:
             continue
 
-        for sheet_name, df in entry.get("sheets", {}).items():
+        for sheet_name, sheet_data in entry.get("sheets", {}).items():
+            # Handle new v7 Structured JSON format
+            if isinstance(sheet_data, dict):
+                data = sheet_data.get("data", [])
+                if not data: continue
+                # Attempt to convert list of dicts to a numeric-friendly DataFrame
+                df = pd.DataFrame(data)
+            else:
+                # Fallback for legacy DataFrame format
+                df = sheet_data
+                
             if df.empty: continue
             
             # Simple numeric column detection
             numeric_cols = df.select_dtypes(include="number").columns
+            if len(numeric_cols) == 0:
+                # Try to convert object columns to numeric if they look like numbers
+                for col in df.columns:
+                    try:
+                        # Convert column to numeric, ignoring commas and symbols
+                        temp_col = pd.to_numeric(df[col].astype(str).str.replace(r'[^0-9.]', '', regex=True), errors='coerce')
+                        if not temp_col.isna().all():
+                            df[col] = temp_col
+                    except:
+                        continue
+                numeric_cols = df.select_dtypes(include="number").columns
+                
             if len(numeric_cols) == 0: continue
             
+            # Use the first numeric column found or one that matches intent
             col = numeric_cols[0]
-            if "sum" in q or "total" in q:
-                return f"Total {col} = {df[col].sum():,.2f}"
-            if "average" in q or "mean" in q:
-                return f"Average {col} = {df[col].mean():,.2f}"
-            if "max" in q or "highest" in q:
-                return f"Highest {col} = {df[col].max():,.2f}"
-            if "min" in q or "lowest" in q:
-                return f"Lowest {col} = {df[col].min():,.2f}"
-            if "count" in q or "how many" in q:
-                return f"Count = {len(df[col])}"
+            
+            try:
+                if "sum" in q or "total" in q:
+                    return f"Total {col} = {df[col].sum():,.2f}"
+                if "average" in q or "mean" in q:
+                    return f"Average {col} = {df[col].mean():,.2f}"
+                if "max" in q or "highest" in q:
+                    return f"Highest {col} = {df[col].max():,.2f}"
+                if "min" in q or "lowest" in q:
+                    return f"Lowest {col} = {df[col].min():,.2f}"
+                if "count" in q or "how many" in q:
+                    return f"Count = {len(df)}"
+            except Exception as e:
+                print(f"--- [NUMERIC] Error calculating {col}: {e} ---")
+                continue
 
     return None
 
@@ -81,11 +109,12 @@ def get_row_by_code(code: str, folder_name: str = None) -> Optional[str]:
             if not json_str: continue
             
             data = json.loads(json_str)
-            row = data.get("data", data) # handle direct dict or nested 'data' key
+            records_list = data.get("data", [])
             
-            if any(str(v).strip() == str(code).strip() for v in row.values() if not isinstance(v, (dict, list))):
-                lines = [f"{k}: {v}" for k, v in row.items() if not isinstance(v, (dict, list))]
-                return "\n".join(lines)
+            for row in records_list:
+                if any(str(v).strip() == str(code).strip() for v in row.values() if not isinstance(v, (dict, list))):
+                    lines = [f"{k}: {v}" for k, v in row.items() if not isinstance(v, (dict, list))]
+                    return "\n".join(lines)
     except:
         pass
     return None

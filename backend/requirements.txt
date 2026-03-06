@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-qdrant-client<1.11.0
+qdrant-client
 sentence-transformers
 langchain>=0.2.0
 langchain-community>=0.2.0

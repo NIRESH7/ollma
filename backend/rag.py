@@ -15,12 +15,13 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from qdrant_client.http import models
 from database import get_qdrant_client
-from excel_query import is_numeric_question, run_dataframe_query
+from excel_query import is_numeric_question, run_dataframe_query, get_row_by_code
 from langchain_core.documents import Document
 
 # ── Configuration ──────────────────────────────────────────────────
 COLLECTION_NAME = "local_documents"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi3:mini")
+# Default to qwen2:1.5b for better performance on Intel i5
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2:1.5b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # ── Model Singletons (loaded once at startup) ──────────────────────
@@ -45,27 +46,24 @@ def _normalize(text: str) -> str:
 
 
 def _analyze_query(question: str) -> dict:
-    """Use a fast LLM call to extract search entities and mapping needs."""
-    prompt = f"""Analyze this question for a database lookup.
-    
+    """Interpret the user's question and locate relevant identifiers or intent."""
+    prompt = f"""ROLE: You are a data assistant that interprets user questions based on a dataset with unknown structures.
+PRIMARY OBJECTIVE: Determine the intent and identify if the question references a specific ID, code, or unique value.
+
 QUESTION: "{question}"
 
 Instructions:
-- "product": Clean product name (e.g. "Glico Pocky").
-- "attributes": List of data points requested (e.g. ["UPC", "Description"]).
-- "search_terms": 3-5 keywords primarily numbers and unique product words.
-- "synonyms": List of equivalent terms. If they ask for "UPC", include ["GTIN", "ArticleCode", "UPC"].
+1. If the question asks for a specific record by an ID or Code (e.g., "What is the status of BUG-001?"), set "action" to "get_row_by_code" and "payload" to that ID.
+2. If the question is general or about patterns (e.g., "How many high severity bugs?"), set "action" to "search_dataset".
+3. Semantic Similarity: Focus on the meaning of the request to identify identifiers.
 
-JSON ONLY:"""
+Return ONLY a valid JSON object:
+{{"action": "...", "payload": "..."}}"""
     try:
         raw = llm.invoke(prompt).strip()
         if "```json" in raw: raw = raw.split("```json")[1].split("```")[0].strip()
         elif "```" in raw: raw = raw.split("```")[1].split("```")[0].strip()
         data = json.loads(raw)
-        # Ensure consistency and expand industry synonyms
-        if any(term in str(data.get("attributes", [])) + str(data.get("synonyms", [])) for term in ["UPC", "GSTIN", "GTIN", "Article"]):
-            if "synonyms" not in data: data["synonyms"] = []
-            data["synonyms"].extend(["GTIN", "ArticleCode", "UPC", "GSTIN", "EAN", "Barcode", "Item Code", "Article Description Code"])
         return data
     except Exception as e:
         print(f"  ⚠️ [QUERY-ANALYSIS] Error: {e}. Falling back.")
@@ -99,7 +97,7 @@ def _hybrid_retrieve(question: str, analysis: dict, folder_name: str = None) -> 
     )
     
     # 1. Path A: Vector Search (Semantic)
-    docs = vector_store.similarity_search(question, k=15, filter=None)
+    docs = vector_store.similarity_search(question, k=2, filter=None)
     
     # 2. Path B: Exact Keyword Filters (Lexical)
     product_name = analysis.get("product", "")
@@ -141,7 +139,7 @@ def _hybrid_retrieve(question: str, analysis: dict, folder_name: str = None) -> 
                         ) for t in filter_tokens
                     ]
                 ),
-                limit=15,
+                limit=5,
                 with_payload=True
             )
             for p in kw_docs:
@@ -195,23 +193,33 @@ def _post_filter(docs: list, keywords: list[str]) -> list:
 
 # ── STEP 6: LLM Answer Generator ──────────────────────────────────
 def _generate_answer(question: str, filtered_docs: list) -> str:
-    """Build context from matched rows and generate a clean, factual answer."""
+    """Generate a direct answer based strictly on the provided dataset records."""
     if not filtered_docs:
-        return "Not found in data."
+        return "No matching data found in the uploaded dataset."
 
-    # Build context: each doc is already a KEY=VALUE string
+    # Build context: each doc is already a KEY: VALUE string
     context_lines = []
     seen = set()
-    for doc in filtered_docs[:12]:  # Top 12 rows
-        line = doc.page_content.strip()
+    for doc in filtered_docs[:2]:  # Top 2 rows for speed/relevance
+        # Format for readability
+        line = doc.page_content.replace(" | ", "\n").strip()
         if line and line not in seen:
             seen.add(line)
             context_lines.append(line)
 
-    context = "\n".join(context_lines)
+    context = "\n---\n".join(context_lines)
 
-    prompt = f"""Use the DATABASE RECORDS to answer the USER QUESTION.
-Provide ONLY the exact value requested. Do not repeat the question.
+    prompt = f"""ROLE: You are a data assistant. Answer strictly based on the DATABASE RECORDS.
+OBJECTIVE: Return ONLY the specific information requested.
+
+COLUMN MATCHING:
+- Semantically match the question intent to the most relevant fields in the records.
+- If multiple fields match, pick the most specific one.
+
+RESPONSE RULES:
+- Return ONLY the direct answer.
+- No explanations. No hallucinations.
+- If not found, say: "No matching data found in the uploaded dataset."
 
 DATABASE RECORDS:
 {context}
@@ -242,40 +250,60 @@ ANSWER:"""
 
 
 
-# ── Main Query Entry Point ─────────────────────────────────────────
 def query_rag(question: str, folder_name: str = None) -> str:
-    print(f"\n[RAG-v2] Question: {question}")
+    print(f"\n[USER QUESTION] {question}")
     start = time.time()
 
-    # 1. Query Analysis
+    # 0. Fast Regex Identifier Check (BUG-XXX, ID-XXX, Alphanumeric Codes)
+    # This short-circuits to avoid LLM Router call for direct lookups
+    id_match = re.search(r'\b(BUG-\d+|[A-Z0-9]{3,}-\d+|\d{4,})\b', question.upper())
+    if id_match:
+        identifier = id_match.group(1)
+        print(f"[ROUTER] Detected Identifier lookup: {identifier}")
+        print(f"[TOOL CALL] get_row_by_code({identifier})")
+        
+        data_match = get_row_by_code(identifier, folder_name)
+        if "not found" not in data_match.lower():
+            print(f"[INFO] Direct ID record found. Passing to LLM for specific extraction.")
+            # Wrap the direct match as a Document and use the generator to extract only the answer
+            id_doc = Document(page_content=data_match, metadata={})
+            return _generate_answer(question, [id_doc])
+
+    # 1. Tool-Based Query Analysis (Fallback for complex queries)
     analysis = _analyze_query(question)
-    keywords = analysis.get("search_terms", []) # updated key
-    print(f"  Analysis: {json.dumps(analysis)}", flush=True)
+    action = analysis.get("action", "search_dataset")
+    payload = analysis.get("payload", "")
+    
+    if action == "get_row_by_code":
+        print(f"[ROUTER] Detected code lookup via AI")
+    else:
+        print(f"[ROUTER] Semantic Search")
 
-    # 2. Route Math
-    if is_numeric_question(question):
-        print("[ROUTE] -- Pandas (math)")
-        df_result = run_dataframe_query(question, folder_name)
-        if df_result:
-            print(f"[PANDAS] Answered in {time.time()-start:.2f}s")
-            return df_result.replace("COMPUTED RESULTS FROM EXCEL DATA:\n", "").strip()
+    # 2. Execute Tool
+    if action == "get_row_by_code" and payload:
+        print(f"[TOOL CALL] get_row_by_code({payload})")
+        data_match = get_row_by_code(payload, folder_name)
+        
+        if "not found" not in data_match.lower():
+            print(f"[TOOL RESULT]\n{data_match}")
+            # Generate answer from the exact record
+            filtered_docs = [Document(page_content=data_match, metadata={})]
+            return _generate_answer(question, filtered_docs)
 
-    # 3. Hybrid Retrieval
-    print("[ROUTE] -- Hybrid Search (Vector + Lexical)")
+    # 3. Fallback to Hybrid Search
+    print("[ROUTE] -- Semantic Search")
     try:
-        docs = _hybrid_retrieve(question, analysis, folder_name)
+        # Standard search logic
+        docs = _hybrid_retrieve(question, {"search_terms": [question]}, folder_name)
     except Exception as e:
-        print(f"[HYBRID-SEARCH] Error: {e}")
-        return "Search engine error. Please try again."
+        print(f"[SEARCH] Error: {e}")
+        return "Search error."
 
     if not docs:
-        return "No data found. Please upload the relevant file first."
+        return "No data found."
 
-    # 4. Filter & De-duplicate
-    filtered_docs = _post_filter(docs, keywords)
-
-    # 5. Answer Generation
-    answer = _generate_answer(question, filtered_docs)
-
-    print(f"[RESULT] '{answer}' (total: {time.time()-start:.2f}s)")
+    # 4. Generate Answer
+    answer = _generate_answer(question, docs[:5])
+    print(f"[AI RESPONSE] {answer}")
+    print(f"--- [INFO] Total response time: {time.time()-start:.2f}s ---")
     return answer

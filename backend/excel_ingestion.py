@@ -72,14 +72,16 @@ def ingest_excel_file(
 
     try:
         if ext in (".xlsx", ".xls"):
+            print(f"[PROCESS] Reading Excel file", flush=True)
             xl = pd.ExcelFile(file_path, engine="openpyxl")
             sheets = xl.sheet_names
         else:
             # CSV case
+            print(f"[PROCESS] Reading CSV file", flush=True)
             sheets = ["CSV_DATA"]
             xl = None
     except Exception as e:
-        print(f"X [TABULAR-INGEST] Failed to open file: {e}")
+        print(f"[ERROR] Failed to read Excel file: {e}")
         return {"error": str(e)}
 
     all_chunks: list[Document] = []
@@ -125,6 +127,8 @@ def ingest_excel_file(
             if _looks_like_header(row_vals_ne) and not any(_is_numeric(v) for v in row_vals_ne):
                 # This row becomes our column names
                 current_columns = [v for v in row_vals if v not in ("", "nan", "None")]
+                print(f"[PROCESS] Columns detected: {current_columns}")
+                print(f"[PROCESS] Total rows detected: {len(rows)}")
                 print(f"    [HEADER-META] Headers detected: {current_columns[:5]}...")
             
             # ── Data Row Processing ──
@@ -201,21 +205,53 @@ def ingest_excel_file(
         total_records = sum(len(v) for v in all_sheet_records.values())
         print(f"  [SUCCESS] Pandas Cache: {total_records} rows across {len(all_sheet_records)} sheets")
 
+        # ── Enhanced Logging: JSON Data Preview ──
+        print(f"\n[CONVERT] Converting Excel to JSON")
+        print(f"[CONVERT] JSON records created: {total_records}")
+        
+        print("\n[JSON DATA START]\n")
+        
+        flat_records = []
+        for sheet_recs in all_sheet_records.values():
+            flat_records.extend(sheet_recs)
+            
+        if total_records <= 20:
+            for i, rec in enumerate(flat_records):
+                print(f"Record {i+1}\n{json.dumps(rec, indent=2)}\n")
+        else:
+            # Print first 10
+            for i in range(10):
+                print(f"Record {i+1}\n{json.dumps(flat_records[i], indent=2)}\n")
+            print("...\n")
+            # Print last 10
+            for i in range(total_records - 10, total_records):
+                print(f"Record {i+1}\n{json.dumps(flat_records[i], indent=2)}\n")
+                
+        print("[JSON DATA END]\n")
+
     if not all_chunks:
         return {"error": "No data detected in Excel. Please check the file structure."}
 
     # ── STEP 3a: Store in Qdrant ──
     try:
+        print(f"[EMBED] Embedding model: all-MiniLM-L6-v2")
+        print(f"[EMBED] Creating embeddings for {len(all_chunks)} rows")
         embeddings = _get_embedding_model()
+        print(f"[EMBED] Embedding generation completed")
+
+        print(f"[QDRANT] Storing embeddings in vector database")
+        print(f"[QDRANT] Collection name: {COLLECTION_NAME}")
+        
         client = get_qdrant_client()
         vector_store = QdrantVectorStore(
             client=client, embedding=embeddings, collection_name=COLLECTION_NAME
         )
         vector_store.add_documents(all_chunks)
         post_count = client.count(collection_name=COLLECTION_NAME).count
-        print(f"  [SUCCESS] Qdrant: {len(all_chunks)} chunks stored. Total vectors: {post_count}", flush=True)
+        print(f"[QDRANT] Vectors inserted: {len(all_chunks)}")
+        print(f"[QDRANT] Storage successful")
     except Exception as e:
-        print(f"[ERROR] [TABULAR-INGEST] Qdrant Error: {e}")
+        print(f"[ERROR] Qdrant/Embedding Error: {e}")
         return {"error": str(e)}
 
     # ── Final Summary Log ──

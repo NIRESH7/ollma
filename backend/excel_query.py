@@ -7,7 +7,94 @@ Step 4a: Detect math questions and run pure Pandas computations
 import re
 import os
 import pandas as pd
+from database import get_qdrant_client
+import json
+import re
+from qdrant_client.http import models
 from typing import Optional
+
+# Re-use collection name
+COLLECTION_NAME = "local_documents"
+
+def get_row_by_code(code: str, folder_name: str = None) -> str:
+    """Retrieve exact record from Qdrant JSON metadata using a code."""
+    client = get_qdrant_client()
+    
+    # Search for the code in metadata.json_data or page_content
+    # We use a broad text match on page_content but filter for high precision
+    scroll_filter_conditions = [
+        models.FieldCondition(
+            key="page_content",
+            match=models.MatchText(text=str(code))
+        )
+    ]
+    if folder_name and folder_name != "All":
+        scroll_filter_conditions.append(
+            models.FieldCondition(
+                key="metadata.folder",
+                match=models.MatchValue(value=folder_name)
+            )
+        )
+
+    search_result, _ = client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=models.Filter(
+            must=scroll_filter_conditions
+        ),
+        limit=5,
+        with_payload=True
+    )
+    
+    if not search_result:
+        return f"Code {code} not found."
+        
+    responses = []
+    for p in search_result:
+        # Check if the code actually exists as a value in the JSON
+        json_str = p.payload.get("metadata", {}).get("json_data", "{}")
+        data = json.loads(json_str)
+        
+        # Exact value check in any field
+        row_dict = data.get("data", {})
+        if any(str(v).strip() == str(code).strip() for v in row_dict.values()):
+            # Format as Key: Value instead of JSON for the user/AI
+            lines = [f"{k}: {v}" for k, v in row_dict.items()]
+            responses.append("\n".join(lines))
+            
+    if not responses:
+        return f"Code {code} not found in structured data."
+        
+    return "\n---\n".join(responses)
+
+def list_columns(folder_name: str = None) -> list[str]:
+    """Retrieve available column names from the current dataset."""
+    client = get_qdrant_client()
+    # Fetch a few records to extract keys
+    scroll_filter_conditions = []
+    if folder_name and folder_name != "All":
+        scroll_filter_conditions.append(
+            models.FieldCondition(
+                key="metadata.folder",
+                match=models.MatchValue(value=folder_name)
+            )
+        )
+
+    records, _ = client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=models.Filter(
+            must=scroll_filter_conditions
+        ),
+        limit=5,
+        with_payload=True
+    )
+    
+    columns = set()
+    for r in records:
+        json_str = r.payload.get("metadata", {}).get("json_data", "{}")
+        data = json.loads(json_str)
+        columns.update(data.get("data", {}).keys())
+        
+    return list(columns)
 
 # Import the shared cache from excel_ingestion
 try:
@@ -139,6 +226,17 @@ def run_dataframe_query(question: str, folder_name: str = "All") -> Optional[str
                     f"Sum={series.sum():,.2f}, Avg={series.mean():,.2f}, "
                     f"Min={series.min():,.2f}, Max={series.max():,.2f}, Count={len(series)}"
                 )
+
+    if is_numeric_question(question):
+        print("[ROUTE] -- Tool: get_row_by_code")
+        # Extract code from question
+        codes = re.findall(r'\b\d+\b', question)
+        if codes:
+            # For simplicity, take the first/largest number as the code
+            code = max(codes, key=len) 
+            result = get_row_by_code(code, folder_name)
+            if "not found" not in result.lower():
+                return result
 
     if not results:
         return None

@@ -11,6 +11,7 @@ from typing import List
 import os
 import shutil
 import time
+import uvicorn
 
 import json
 from fastapi import Form
@@ -64,28 +65,24 @@ def startup_event():
     print(f"--- [STARTUP] Checking Qdrant Collection (Size: {VECTOR_SIZE}) ---")
     try:
         client = get_qdrant_client()
-        collections = client.get_collections()
-        exists = any(c.name == COLLECTION_NAME for c in collections.collections)
+        # Simplest way to check for collections
+        collections_resp = client.get_collections()
+        col_names = [c.name for c in collections_resp.collections]
         
-        if exists:
-            # Check for dimension mismatch
-            info = client.get_collection(COLLECTION_NAME)
-            current_dim = info.config.params.vectors.size
-            if current_dim != VECTOR_SIZE:
-                print(f"--- [STARTUP] Dimension Mismatch ({current_dim} vs {VECTOR_SIZE}). Recreating collection... ---")
-                client.delete_collection(COLLECTION_NAME)
-                exists = False
-
-        if not exists:
+        if COLLECTION_NAME not in col_names:
             print(f"--- [STARTUP] Creating Collection '{COLLECTION_NAME}' with size {VECTOR_SIZE} ---")
             client.create_collection(
                 collection_name=COLLECTION_NAME,
-                vectors_config=models.VectorParams(size=VECTOR_SIZE, distance=models.Distance.COSINE),
+                vectors_config={
+                    "size": VECTOR_SIZE,
+                    "distance": "Cosine"
+                }
             )
         else:
             print(f"--- [STARTUP] Collection '{COLLECTION_NAME}' already exists. ---")
     except Exception as e:
-        print(f"--- [STARTUP] Error checking/creating collection: {e} ---")
+        # Log and continue - don't crash the server
+        print(f"--- [STARTUP] Warning/Error checking collection: {e} ---")
 
 @app.on_event("shutdown")
 def shutdown_event():
@@ -193,18 +190,20 @@ def delete_folder(folder_name: str):
     print(f"--- [API] Deleting folder: {folder_name} ---")
     try:
         client = get_qdrant_client()
-        # 1. Delete vectors from Qdrant
-        client.delete(
-            collection_name=COLLECTION_NAME,
-            points_selector=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="metadata.folder",
-                        match={"value": folder_name}
-                    )
-                ]
+        # 1. Delete vectors from Qdrant using simple Filter
+        # Note: if the folder is "All", we don't delete by metadata, we might want to skip or handle differently
+        if folder_name and folder_name != "All":
+            client.delete(
+                collection_name=COLLECTION_NAME,
+                points_selector=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="metadata.folder",
+                            match=models.MatchValue(value=folder_name)
+                        )
+                    ]
+                )
             )
-        )
         
         # 2. Remove from folders.json
         folders = get_folders()
@@ -228,6 +227,7 @@ def upload_file(
     folder: str = Form("default"),
     job_id: str = Form(None)
 ):
+    print(f"\n[UPLOAD] File upload started", flush=True)
     print(f"--- [API] Received Upload Request for {len(files)} files in folder: {folder} (Job: {job_id}) ---", flush=True)
     
     if job_id:
@@ -244,6 +244,14 @@ def upload_file(
     for file in files:
         try:
             file_path = os.path.join(upload_dir, file.filename)
+            # Get file size
+            file.file.seek(0, os.SEEK_END)
+            file_size = file.file.tell()
+            file.file.seek(0)
+            
+            print(f"[UPLOAD] File received: {file.filename}")
+            print(f"[UPLOAD] File size: {file_size} bytes")
+            
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
             
@@ -267,6 +275,7 @@ def upload_file(
                 error = ingest_result["error"]
                 print(f"--- [API] Error ingesting {file.filename}: {error} ---")
             else:
+                print(f"[UPLOAD] Upload successful")
                 print(f"--- [API] Successfully ingested {file.filename} ---", flush=True)
                 
             results.append({

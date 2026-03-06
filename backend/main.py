@@ -12,6 +12,17 @@ import os
 import shutil
 import time
 import uvicorn
+import logging
+
+# ── Silence Polling Logs ───────────────────────────────────────────
+class PollingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Stop printing the constant "GET /upload-status" clutter
+        return "/upload-status/" not in record.getMessage()
+
+# Apply the filter to uvicorn access logs
+logging.getLogger("uvicorn.access").addFilter(PollingFilter())
+# ──────────────────────────────────────────────────────────────────
 
 import json
 from fastapi import Form
@@ -48,6 +59,10 @@ upload_stats = {}
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    # Silence the polling checks to keep the terminal clean for the user
+    if "/upload-status/" in request.url.path:
+        return await call_next(request)
+        
     start_time = time.time()
     print(f"--- [DEBUG] INCOMING REQUEST: {request.method} {request.url.path} ---")
     response = await call_next(request)

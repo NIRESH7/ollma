@@ -1,270 +1,192 @@
 """
-Structured Excel Parsing Flow (v6)
-Flow: Excel -> Openpyxl -> Custom Layout Parser -> Pandas -> JSON Schema Builder -> Embeddings -> Qdrant -> LLM
+Deterministic Spreadsheet Ingestion & Hybrid Intelligence (v7)
+Features:
+1. Multi-layout detection (tabular, key-value, hierarchical)
+2. snake_case JSON normalization
+3. Memory-cached structured data for instant lookup
 """
 
 import os
 import re
+import time
 import json
 import warnings
 import datetime
 import pandas as pd
-from typing import Optional, Callable
+from typing import Optional, List, Dict, Any
 from langchain_core.documents import Document
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from database import get_qdrant_client
+from langchain_community.llms import Ollama
 
 warnings.filterwarnings("ignore")
 
+# ── Configuration ──────────────────────────────────────────────────
 COLLECTION_NAME = "local_documents"
-# STEP 3b: Pandas Cache — {file_path: {file_name, folder, sheets: {sheet_name: DataFrame}}}
-EXCEL_CACHE: dict = {}
+OLLAMA_MODEL = "qwen2:1.5b"
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
+# Global Cache for instant structured lookup
+EXCEL_CACHE: Dict[str, Any] = {}
 
-def _get_embedding_model():
-    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
+# ── Helpers ────────────────────────────────────────────────────────
+def _to_snake_case(text: str) -> str:
+    """Normalize string to lowercase_snake_case."""
+    s = str(text).strip()
+    s = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s)
+    s = re.sub(r'[^a-zA-Z0-9]', '_', s).lower()
+    return re.sub(r'_+', '_', s).strip('_')
 
 def _is_numeric(val) -> bool:
     try:
-        if pd.isna(val):
-            return False
-        float(str(val).replace(",", ""))
+        if pd.isna(val) or str(val).strip() == "": return False
+        float(str(val).replace(",", "").replace("%", ""))
         return True
-    except (ValueError, TypeError):
+    except:
         return False
 
+def _looks_like_header(row: List[Any]) -> bool:
+    """A row is a header if it's mostly non-numeric strings."""
+    non_empty = [v for v in row if str(v).strip()]
+    if len(non_empty) < 2: return False
+    string_count = sum(1 for v in non_empty if not _is_numeric(v) and len(str(v)) > 1)
+    return string_count >= len(non_empty) * 0.7
 
-def _looks_like_header(row_vals: list) -> bool:
-    """A header row has mostly short non-numeric strings."""
-    if not row_vals:
-        return False
-    non_empty = [v for v in row_vals if str(v).strip() not in ("", "nan", "None")]
-    if len(non_empty) < 2:
-        return False
-    string_count = sum(1 for v in non_empty if not _is_numeric(v) and 1 < len(str(v)) < 60)
-    return string_count >= len(non_empty) * 0.6
-
-
-def _looks_like_section_header(row_vals: list) -> bool:
-    """A section header is a single prominent label (e.g., 'DIA-26')."""
-    non_empty = [str(v).strip() for v in row_vals if str(v).strip() not in ("", "nan", "None")]
-    return len(non_empty) == 1 and len(non_empty[0]) < 40
-
-
-def ingest_excel_file(
-    file_path: str,
-    folder_name: str = "default",
-    progress_callback: Optional[Callable] = None,
-):
+def _detect_layout(df: pd.DataFrame) -> str:
     """
-    Full Hybrid Excel Ingestion:
-    1. Read every sheet
-    2. Track section headers (e.g. DIA-26)
-    3. Detect column header rows dynamically
-    4. Flatten each data row → KEY=VALUE string
-    5. Store in Qdrant + Pandas Cache
+    Detects if the dataframe follows a 'tabular', 'key_value', or 'hierarchical' layout.
+    """
+    if df.empty: return "unknown"
+    
+    # 1. Check for tabular: Mostly columns with a header in top 5 rows
+    header_found = False
+    for i in range(min(5, len(df))):
+        if _looks_like_header(df.iloc[i].tolist()):
+            header_found = True
+            break
+            
+    # 2. Check for key-value: Two main columns where first is mostly labels
+    non_empty_cols = [c for c in df.columns if not df[c].astype(str).str.strip().eq("").all()]
+    if len(non_empty_cols) == 2:
+        col1 = df[non_empty_cols[0]].astype(str).str.strip()
+        # If column 1 has many unique short strings and is mostly non-blank
+        if col1.nunique() > len(df) * 0.5:
+            return "key_value"
+            
+    if header_found: return "tabular"
+    
+    # Default to hierarchical if mixed or complex
+    return "hierarchical"
+
+# ── Ingestion Logic ──────────────────────────────────────────────
+def ingest_with_intelligence_engine(file_path: str, folder_name: str = "default"):
+    """
+    High-Performance Deterministic Ingestion Engine.
     """
     file_name = os.path.basename(file_path)
-    ext = os.path.splitext(file_path)[1].lower()
-    print(f"\n[TABULAR-INGEST] Processing: {file_name}", flush=True)
-
+    print(f"\n🚀 [HYBRID-ENGINE] Starting Deterministic Extraction: {file_name}", flush=True)
+    start_time_total = time.time()
+    
     try:
+        ext = os.path.splitext(file_path)[1].lower()
         if ext in (".xlsx", ".xls"):
-            print(f"[PROCESS] Reading Excel file", flush=True)
             xl = pd.ExcelFile(file_path, engine="openpyxl")
             sheets = xl.sheet_names
         else:
-            # CSV case
-            print(f"[PROCESS] Reading CSV file", flush=True)
             sheets = ["CSV_DATA"]
             xl = None
     except Exception as e:
-        print(f"[ERROR] Failed to read Excel file: {e}")
+        print(f"[ERROR] Load fail: {e}")
         return {"error": str(e)}
 
-    all_chunks: list[Document] = []
-    all_sheet_records: dict[str, list[dict]] = {}
+    all_docs = []
+    file_structured_data = {"folder": folder_name, "sheets": {}}
 
-    for s_idx, sheet_name in enumerate(sheets):
-        print(f"  [FILE-SECTION] Processing Section: {sheet_name}")
-        if progress_callback and xl:
-            progress_callback(s_idx + 1, len(sheets))
-
+    for sheet_name in sheets:
+    
+        print(f"\n  🔍 [FILE] Scanning Sheet: {sheet_name}", flush=True)
         try:
             if xl:
-                raw_df = xl.parse(sheet_name, header=None, dtype=str)
+                df = xl.parse(sheet_name, header=None).fillna("")
             else:
-                raw_df = pd.read_csv(file_path, header=None, dtype=str)
-            raw_df = raw_df.fillna("")
-        except Exception as e:
-            print(f"  ! [TABULAR-INGEST] Could not parse '{sheet_name}': {e}")
-            continue
+                df = pd.read_csv(file_path, header=None).fillna("")
+        except: continue
 
-        rows = raw_df.values.tolist()
+        layout = _detect_layout(df)
+        print(f"    LOG: STRUCTURE_DETECTED | Layout: {layout}")
+
+        sheet_json = {"layout": layout, "data": []}
         
-        current_section = sheet_name      # Will be updated if we find a header like "DIA-26"
-        current_columns: list[str] = []
-        sheet_records: list[dict] = []
-
-        for row_idx, raw_row in enumerate(rows):
-            # Clean the row
-            row_vals = [str(v).strip() for v in raw_row]
-            row_vals_ne = [v for v in row_vals if v not in ("", "nan", "None")]
-            
-            if not row_vals_ne:
-                continue  # Skip completely empty rows
-
-            # ── Detect Section Header (e.g. "DIA-26") ──
-            if _looks_like_section_header(row_vals_ne):
-                current_section = row_vals_ne[0]
-                current_columns = []  # Reset columns for new section
-                print(f"    [SECTION-META] Section: {current_section}")
-                continue
-
-            # ── Detect Column Header Row ──
-            if _looks_like_header(row_vals_ne) and not any(_is_numeric(v) for v in row_vals_ne):
-                # This row becomes our column names
-                current_columns = [v for v in row_vals if v not in ("", "nan", "None")]
-                print(f"[PROCESS] Columns detected: {current_columns}")
-                print(f"[PROCESS] Total rows detected: {len(rows)}")
-                print(f"    [HEADER-META] Headers detected: {current_columns[:5]}...")
-            
-            # ── Data Row Processing ──
-            if current_columns:
-                # 1. Clean Content: Direct data for LLM
-                record_data = {}
-                for j, val in enumerate(row_vals):
-                    col_name = current_columns[j] if j < len(current_columns) else f"Col_{j}"
-                    if val not in ("", "nan", "None"):
-                        record_data[col_name] = val
+        # --- DETERMINISTIC PARSERS ---
+        if layout == "tabular":
+            header_idx = -1
+            for i in range(5):
+                if _looks_like_header(df.iloc[i].tolist()):
+                    header_idx = i; break
+            if header_idx >= 0:
+                headers = [_to_snake_case(h) for h in df.iloc[header_idx]]
+                data_df = df.iloc[header_idx+1:].copy()
+                data_df.columns = headers
+                sheet_json["data"] = data_df.to_dict(orient="records")
                 
-                if not record_data:
-                    continue
-                
-                sheet_records.append(record_data)
-                kv_pairs = [f"{k}: {v}" for k, v in record_data.items()]
-                clean_content = " | ".join(kv_pairs)
-                
-                # 2. Metadata & Raw Backup
-                record = {
-                    "source": file_name,
+        elif layout == "key_value":
+            # Extract Label -> Value pairs
+            for idx, row in df.iterrows():
+                vals = [str(v).strip() for v in row if str(v).strip()]
+                if len(vals) >= 2:
+                    sheet_json["data"].append({_to_snake_case(vals[0]): vals[1]})
+
+        else: # Hierarchical fallback
+            # Simple hierarchical preservation (Section -> Content)
+            current_section = "General"
+            for idx, row in df.iterrows():
+                vals = [str(v).strip() for v in row if str(v).strip()]
+                if len(vals) == 1:
+                    current_section = vals[0]
+                elif len(vals) > 1:
+                    sheet_json["data"].append({
+                        "section": _to_snake_case(current_section),
+                        "row_data": [str(v) for v in vals]
+                    })
+
+        file_structured_data["sheets"][sheet_name] = sheet_json
+        
+        # --- EMBEDDING PREPARATION ---
+        # Flatten to segments: [Sheet > Section > Key: Value]
+        segments = _flatten_structured_json(sheet_json, sheet_name)
+        for seg in segments:
+            all_docs.append(Document(
+                page_content=seg,
+                metadata={
+                    "file_name": file_name,
                     "sheet": sheet_name,
-                    "section": current_section,
-                    "data": record_data
+                    "folder": folder_name,
+                    "json_data": json.dumps(sheet_json) # Store full structure context
                 }
-                raw_row_str = " | ".join(row_vals_ne)
-                json_string = json.dumps(record, ensure_ascii=False)
-                
-                all_chunks.append(Document(
-                    page_content=clean_content,
-                    metadata={
-                        "source": file_path,
-                        "file_name": file_name,
-                        "sheet": sheet_name,
-                        "section": current_section,
-                        "folder": folder_name,
-                        "source_type": "structured_tabular",
-                        "timestamp": datetime.datetime.utcnow().isoformat(),
-                        "json_data": json_string,
-                        "raw_row": raw_row_str
-                    }
-                ))
-            else:
-                # No columns yet — treat as text chunk
-                content_text = " ".join(row_vals_ne)
-                semantic_string = f"Data in {sheet_name}, Section {current_section}: {content_text}"
-                
-                all_chunks.append(Document(
-                    page_content=semantic_string,
-                    metadata={
-                        "source": file_path,
-                        "file_name": file_name,
-                        "sheet": sheet_name,
-                        "section": current_section,
-                        "folder": folder_name,
-                        "source_type": "tabular_unstructured",
-                        "timestamp": datetime.datetime.utcnow().isoformat(),
-                    }
-                ))
+            ))
 
-        if sheet_records:
-            all_sheet_records[sheet_name] = sheet_records
-
-    # ── STEP 3b: Store in Pandas Cache ──
-    if all_sheet_records:
-        EXCEL_CACHE[file_path] = {
-            "file_name": file_name,
-            "folder": folder_name,
-            "sheets": {
-                sn: pd.DataFrame(recs)
-                for sn, recs in all_sheet_records.items()
-            }
-        }
-        total_records = sum(len(v) for v in all_sheet_records.values())
-        print(f"  [SUCCESS] Pandas Cache: {total_records} rows across {len(all_sheet_records)} sheets")
-
-        # ── Enhanced Logging: JSON Data Preview ──
-        print(f"\n[CONVERT] Converting Excel to JSON")
-        print(f"[CONVERT] JSON records created: {total_records}")
-        
-        print("\n[JSON DATA START]\n")
-        
-        flat_records = []
-        for sheet_recs in all_sheet_records.values():
-            flat_records.extend(sheet_recs)
-            
-        if total_records <= 20:
-            for i, rec in enumerate(flat_records):
-                print(f"Record {i+1}\n{json.dumps(rec, indent=2)}\n")
-        else:
-            # Print first 10
-            for i in range(10):
-                print(f"Record {i+1}\n{json.dumps(flat_records[i], indent=2)}\n")
-            print("...\n")
-            # Print last 10
-            for i in range(total_records - 10, total_records):
-                print(f"Record {i+1}\n{json.dumps(flat_records[i], indent=2)}\n")
-                
-        print("[JSON DATA END]\n")
-
-    if not all_chunks:
-        return {"error": "No data detected in Excel. Please check the file structure."}
-
-    # ── STEP 3a: Store in Qdrant ──
-    try:
-        print(f"[EMBED] Embedding model: all-MiniLM-L6-v2")
-        print(f"[EMBED] Creating embeddings for {len(all_chunks)} rows")
-        embeddings = _get_embedding_model()
-        print(f"[EMBED] Embedding generation completed")
-
-        print(f"[QDRANT] Storing embeddings in vector database")
-        print(f"[QDRANT] Collection name: {COLLECTION_NAME}")
-        
+    # --- MEMORY CACHING for Instant Lookup ---
+    EXCEL_CACHE[file_path] = file_structured_data
+    
+    # --- STORAGE ---
+    if all_docs:
+        print(f"[QDRANT] Starting Batch Insert | Docs: {len(all_docs)}")
+        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
         client = get_qdrant_client()
-        vector_store = QdrantVectorStore(
-            client=client, embedding=embeddings, collection_name=COLLECTION_NAME
-        )
-        vector_store.add_documents(all_chunks)
-        post_count = client.count(collection_name=COLLECTION_NAME).count
-        print(f"[QDRANT] Vectors inserted: {len(all_chunks)}")
-        print(f"[QDRANT] Storage successful")
-    except Exception as e:
-        print(f"[ERROR] Qdrant/Embedding Error: {e}")
-        return {"error": str(e)}
+        vector_store = QdrantVectorStore(client=client, embedding=embeddings, collection_name=COLLECTION_NAME)
+        vector_store.add_documents(all_docs, batch_size=64)
+    
+    elapsed = int(time.time() - start_time_total)
+    print(f"🏆 INGESTION COMPLETE | TIME: {elapsed}s")
+    return {"status": "completed"}
 
-    # ── Final Summary Log ──
-    total_rows = sum(len(recs) for recs in all_sheet_records.values())
-    print(f"\n📊 [EXCEL-INGESTED] Migration Summary for {file_name}:")
-    print(f"   • Total Sheets Processed: {len(all_sheet_records)}")
-    for sn, recs in all_sheet_records.items():
-        print(f"   • Sheet '{sn}': {len(recs)} data rows identified.")
-    print(f"   • Total AI Chunks Created: {len(all_chunks)}\n")
-
-    return {
-        "status": "Success",
-        "num_chunks": len(all_chunks),
-        "total_rows": total_rows,
-        "total_vectors": post_count,
-    }
+def _flatten_structured_json(sheet_json: Dict, sheet_name: str) -> List[str]:
+    segments = []
+    for item in sheet_json.get("data", []):
+        if isinstance(item, dict):
+            parts = [f"Sheet: {sheet_name}"]
+            for k, v in item.items():
+                parts.append(f"{k}: {v}")
+            segments.append(" | ".join(parts))
+    return segments

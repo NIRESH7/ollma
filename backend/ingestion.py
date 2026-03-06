@@ -6,7 +6,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from database import get_qdrant_client
 from langchain_core.documents import Document
-from excel_ingestion import ingest_excel_file
+from excel_ingestion import ingest_with_intelligence_engine
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -91,11 +91,11 @@ def ingest_file(file_path: str, folder_name: str = "default", progress_callback=
         print(f"--- [INGEST] ERROR: File not found at {file_path} ---")
         return {"error": "File not found"}
 
-    # ── Route Tabular files (Excel/CSV) to the dedicated engine ──
+    # ── Route Data files (Excel/CSV/TXT) to the Universal Spreadsheet Intelligence Engine ──
     ext = os.path.splitext(file_path)[1].lower()
-    if ext in (".xlsx", ".xls", ".csv"):
-        print(f"--- [INGEST] Routing to Tabular ingestion module for: {file_path} ---")
-        return ingest_excel_file(file_path, folder_name, progress_callback)
+    if ext in (".xlsx", ".xls", ".csv", ".txt"):
+        print(f"--- [INGEST] Routing to Universal Spreadsheet Intelligence Engine for: {file_path} ---")
+        return ingest_with_intelligence_engine(file_path, folder_name)
 
     docs = []
     used_ocr = False

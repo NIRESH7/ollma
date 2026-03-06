@@ -1,74 +1,115 @@
 """
-Excel Hybrid Query Engine (v7 - Helper Module)
-Provides helper functions for numeric checks and basic row lookups.
-Updated to support the new v7 Deterministic Cache format.
+Structured Excel Query Helpers.
 """
 
 import re
-import json
-import os
-import pandas as pd
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-# Configuration
-COLLECTION_NAME = "local_documents"
+import pandas as pd
+
+from excel_ingestion import load_structured_payloads
+
 
 def is_numeric_question(question: str) -> bool:
-    """Return True if the question requires a math computation."""
-    numeric_keywords = {"sum", "total", "average", "mean", "max", "min", "highest", "lowest", "count", "how many"}
+    numeric_keywords = {
+        "sum",
+        "total",
+        "average",
+        "mean",
+        "max",
+        "min",
+        "highest",
+        "lowest",
+        "count",
+        "how many",
+    }
     q = question.lower()
     return any(k in q for k in numeric_keywords)
 
-try:
-    from excel_ingestion import EXCEL_CACHE
-except ImportError:
-    EXCEL_CACHE = {}
+
+def _tokenize(text: str) -> List[str]:
+    tokens = re.split(r"[\W_]+", (text or "").lower())
+    return [t for t in tokens if len(t) > 1 or t.isdigit()]
+
+
+def _sheet_to_dataframe(sheet_data: Dict[str, Any]) -> pd.DataFrame:
+    records = sheet_data.get("records", [])
+    if records:
+        rows = [r.get("values", {}) for r in records if isinstance(r.get("values"), dict)]
+        return pd.DataFrame(rows)
+    raw_rows = sheet_data.get("raw_rows", [])
+    if raw_rows:
+        rows = [r.get("values", {}) for r in raw_rows if isinstance(r.get("values"), dict)]
+        return pd.DataFrame(rows)
+    return pd.DataFrame(sheet_data.get("data", []))
+
+
+def _to_numeric_series(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series.astype(str).str.replace(r"[^0-9.\-]", "", regex=True), errors="coerce")
+
+
+def _choose_numeric_column(question: str, numeric_cols: List[str]) -> Optional[str]:
+    if not numeric_cols:
+        return None
+    q_tokens = set(_tokenize(question))
+    best_col = numeric_cols[0]
+    best_score = 0
+    for col in numeric_cols:
+        col_tokens = set(_tokenize(col.replace("_", " ")))
+        score = len(q_tokens & col_tokens)
+        if score > best_score:
+            best_score = score
+            best_col = col
+    return best_col
+
+
+def _filter_rows_by_question(df: pd.DataFrame, question: str) -> pd.DataFrame:
+    q_tokens = [t for t in _tokenize(question) if len(t) > 2]
+    if not q_tokens or df.empty:
+        return df
+
+    text_cols = [c for c in df.columns if df[c].dtype == "object"]
+    if not text_cols:
+        return df
+
+    row_scores = pd.Series(0, index=df.index, dtype="int64")
+    for col in text_cols:
+        col_series = df[col].astype(str).str.lower()
+        for token in q_tokens:
+            row_scores += col_series.str.contains(token, regex=False).astype("int64")
+
+    filtered = df[row_scores > 0]
+    return filtered if not filtered.empty else df
+
 
 def run_dataframe_query(question: str, folder_name: str = "All") -> Optional[str]:
-    """
-    Simplified Numeric Engine for EXCEL_CACHE.
-    Supports both legacy DataFrames and new v7 Structured JSON.
-    """
-    if not EXCEL_CACHE:
+    payloads = load_structured_payloads(folder_name=folder_name)
+    if not payloads:
         return None
 
     q = question.lower()
-    for file_path, entry in EXCEL_CACHE.items():
-        if folder_name != "All" and entry.get("folder") != folder_name:
-            continue
+    for payload in payloads:
+        for _, sheet_data in payload.get("sheets", {}).items():
+            df = _sheet_to_dataframe(sheet_data)
+            if df.empty:
+                continue
 
-        for sheet_name, sheet_data in entry.get("sheets", {}).items():
-            # Handle new v7 Structured JSON format
-            if isinstance(sheet_data, dict):
-                data = sheet_data.get("data", [])
-                if not data: continue
-                # Attempt to convert list of dicts to a numeric-friendly DataFrame
-                df = pd.DataFrame(data)
-            else:
-                # Fallback for legacy DataFrame format
-                df = sheet_data
-                
-            if df.empty: continue
-            
-            # Simple numeric column detection
-            numeric_cols = df.select_dtypes(include="number").columns
-            if len(numeric_cols) == 0:
-                # Try to convert object columns to numeric if they look like numbers
-                for col in df.columns:
-                    try:
-                        # Convert column to numeric, ignoring commas and symbols
-                        temp_col = pd.to_numeric(df[col].astype(str).str.replace(r'[^0-9.]', '', regex=True), errors='coerce')
-                        if not temp_col.isna().all():
-                            df[col] = temp_col
-                    except:
-                        continue
-                numeric_cols = df.select_dtypes(include="number").columns
-                
-            if len(numeric_cols) == 0: continue
-            
-            # Use the first numeric column found or one that matches intent
-            col = numeric_cols[0]
-            
+            df = _filter_rows_by_question(df, q)
+
+            numeric_cols: List[str] = []
+            for col in df.columns:
+                num_col = _to_numeric_series(df[col])
+                if not num_col.isna().all():
+                    df[col] = num_col
+                    numeric_cols.append(col)
+
+            if not numeric_cols:
+                continue
+
+            col = _choose_numeric_column(q, numeric_cols)
+            if not col:
+                continue
+
             try:
                 if "sum" in q or "total" in q:
                     return f"Total {col} = {df[col].sum():,.2f}"
@@ -86,35 +127,14 @@ def run_dataframe_query(question: str, folder_name: str = "All") -> Optional[str
 
     return None
 
-def get_row_by_code(code: str, folder_name: str = None) -> Optional[str]:
-    """Retrieve exactly matched row from Qdrant metadata."""
-    from database import get_qdrant_client
-    client = get_qdrant_client()
-    
-    try:
-        # Search for code in raw_row or json_data via scrolling
-        records, _ = client.scroll(
-            collection_name=COLLECTION_NAME,
-            limit=20,
-            with_payload=True
-        )
-        
-        for r in records:
-            payload = r.payload
-            metadata = payload.get("metadata", {})
-            if folder_name and folder_name != "All" and metadata.get("folder") != folder_name:
-                continue
-                
-            json_str = metadata.get("json_data")
-            if not json_str: continue
-            
-            data = json.loads(json_str)
-            records_list = data.get("data", [])
-            
-            for row in records_list:
-                if any(str(v).strip() == str(code).strip() for v in row.values() if not isinstance(v, (dict, list))):
-                    lines = [f"{k}: {v}" for k, v in row.items() if not isinstance(v, (dict, list))]
-                    return "\n".join(lines)
-    except:
-        pass
+
+def get_row_by_code(code: str, folder_name: str = "All") -> Optional[str]:
+    code_norm = str(code).strip().lower()
+    payloads = load_structured_payloads(folder_name=folder_name)
+    for payload in payloads:
+        for _, sheet_data in payload.get("sheets", {}).items():
+            for record in sheet_data.get("records", []):
+                values = record.get("values", {})
+                if any(str(v).strip().lower() == code_norm for v in values.values()):
+                    return "\n".join([f"{k}: {v}" for k, v in values.items()])
     return None

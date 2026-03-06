@@ -18,7 +18,12 @@ def get_qdrant_client():
             _client_instance = QdrantClient(url=url, api_key=api_key)
         else:
             print(f"--- [DB] Initializing QdrantClient with local path: {QDRANT_PATH} ---")
-            _client_instance = QdrantClient(path=QDRANT_PATH)
+            # FastAPI request handling may access Qdrant from different threads.
+            # Disable SQLite same-thread guard for local mode to avoid runtime failures.
+            _client_instance = QdrantClient(
+                path=QDRANT_PATH,
+                force_disable_check_same_thread=True,
+            )
     return _client_instance
 
 def close_qdrant_client():
@@ -31,4 +36,3 @@ def close_qdrant_client():
             print(f"--- [DB] Error closing QdrantClient: {e} ---", flush=True)
         finally:
             _client_instance = None
-

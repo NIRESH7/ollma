@@ -28,9 +28,11 @@ import json
 from fastapi import Form
 from ingestion import ingest_file
 from rag import query_rag
+from excel_ingestion import delete_structured_cache
 
 from database import get_qdrant_client, close_qdrant_client
 from qdrant_client.http import models
+from embeddings_provider import get_embeddings
 
 app = FastAPI(title="Local RAG API")
 
@@ -72,12 +74,12 @@ async def log_requests(request: Request, call_next):
 
 # Configuration matching other files
 COLLECTION_NAME = "local_documents"
-# Dynamic vector size based on embedding model
-VECTOR_SIZE = 1536 if os.getenv("OPENAI_API_KEY") else 384 
+# Dynamic vector size from active embedding backend
+_, VECTOR_SIZE, VECTOR_BACKEND = get_embeddings()
 
 @app.on_event("startup")
 def startup_event():
-    print(f"--- [STARTUP] Checking Qdrant Collection (Size: {VECTOR_SIZE}) ---")
+    print(f"--- [STARTUP] Checking Qdrant Collection (Size: {VECTOR_SIZE}, Backend: {VECTOR_BACKEND}) ---")
     try:
         client = get_qdrant_client()
         # Simplest way to check for collections
@@ -192,8 +194,18 @@ def list_folder_files(folder_name: str):
         )
         
         for p in points:
-            if p.payload and "source" in p.payload:
+            if not p.payload:
+                continue
+
+            if "source" in p.payload and p.payload["source"]:
                 unique_files.add(os.path.basename(p.payload["source"]))
+                continue
+
+            metadata = p.payload.get("metadata", {})
+            if isinstance(metadata, dict):
+                meta_source = metadata.get("source") or metadata.get("file_name")
+                if meta_source:
+                    unique_files.add(os.path.basename(meta_source))
                 
         return {"files": list(unique_files)}
     except Exception as e:
@@ -220,14 +232,21 @@ def delete_folder(folder_name: str):
                 )
             )
         
-        # 2. Remove from folders.json
+        # 2. Remove structured cache entries for the folder.
+        cache_cleanup = delete_structured_cache(folder_name)
+
+        # 3. Remove from folders.json
         folders = get_folders()
         if folder_name in folders:
             folders.remove(folder_name)
             with open(FOLDERS_FILE, "w") as f:
                 json.dump(folders, f)
         
-        return {"status": "deleted", "folder": folder_name}
+        return {
+            "status": "deleted",
+            "folder": folder_name,
+            "cache_cleanup": cache_cleanup,
+        }
     except Exception as e:
         print(f"--- [API] Error deleting folder: {e} ---")
         raise HTTPException(status_code=500, detail=str(e))

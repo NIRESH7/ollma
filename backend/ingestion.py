@@ -2,11 +2,11 @@ import os
 import warnings
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from database import get_qdrant_client
 from langchain_core.documents import Document
 from excel_ingestion import ingest_with_intelligence_engine
+from embeddings_provider import get_embeddings
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -91,9 +91,9 @@ def ingest_file(file_path: str, folder_name: str = "default", progress_callback=
         print(f"--- [INGEST] ERROR: File not found at {file_path} ---")
         return {"error": "File not found"}
 
-    # ── Route Data files (Excel/CSV/TXT) to the Universal Spreadsheet Intelligence Engine ──
+    # ── Route spreadsheet data files to the structured intelligence engine ──
     ext = os.path.splitext(file_path)[1].lower()
-    if ext in (".xlsx", ".xls", ".csv", ".txt"):
+    if ext in (".xlsx", ".xlsm", ".xls", ".csv"):
         print(f"--- [INGEST] Routing to Universal Spreadsheet Intelligence Engine for: {file_path} ---")
         return ingest_with_intelligence_engine(file_path, folder_name)
 
@@ -152,13 +152,9 @@ def ingest_file(file_path: str, folder_name: str = "default", progress_callback=
     splits = text_splitter.split_documents(docs)
     print(f"--- [INGEST] Split into {len(splits)} chunks for Vector Search ---", flush=True)
     
-    # 3. Embeddings (Choose based on env to save memory on Render)
-    if os.getenv("OPENAI_API_KEY"):
-        from langchain_openai import OpenAIEmbeddings
-        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    else:
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-        embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    # 3. Embeddings (supports offline fallback)
+    embeddings, _, embedding_backend = get_embeddings()
+    print(f"--- [INGEST] Embedding backend: {embedding_backend} ---")
     
     # Use Singleton Client
     client = get_qdrant_client()

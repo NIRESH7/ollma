@@ -73,13 +73,15 @@ def _looks_like_header(row: List[Any]) -> bool:
     return string_count >= len(non_empty) * 0.7
 
 
-def _header_score(row: List[str]) -> float:
+def _header_score(row: List[str], row_idx: int) -> float:
     non_empty = _non_empty_values(row)
     if len(non_empty) < 2:
         return 0.0
     unique_ratio = len(set(non_empty)) / max(1, len(non_empty))
-    alpha_ratio = sum(1 for v in non_empty if re.search(r"[A-Za-z]", v)) / len(non_empty)
-    return unique_ratio + alpha_ratio
+    alpha_count = sum(1 for v in non_empty if re.search(r"[A-Za-z]", v))
+    length_bonus = len(non_empty) * 0.1
+    index_penalty = row_idx * 0.05
+    return unique_ratio + length_bonus + alpha_count - index_penalty
 
 
 def _dedupe_headers(headers: List[str]) -> List[str]:
@@ -97,17 +99,23 @@ def _detect_layout(df: pd.DataFrame) -> str:
     if df.empty:
         return "unknown"
 
-    header_found = False
-    max_scan = min(8, len(df))
-    for i in range(max_scan):
-        if _looks_like_header(df.iloc[i].tolist()):
+    # Improved tabular detection: if we see columns with headers like "Plan" or "Category"
+    potential_headers = []
+    for i in range(min(15, len(df))):
+        row = df.iloc[i].tolist()
+        if _looks_like_header(row):
             header_found = True
+            potential_headers = row
             break
+
+    # If many columns have headers containing "plan", it is likely tabular
+    if any("plan" in str(h).lower() for h in potential_headers):
+        return "tabular"
 
     non_empty_cols = [c for c in df.columns if not df[c].astype(str).str.strip().eq("").all()]
     if len(non_empty_cols) == 2:
         col1 = df[non_empty_cols[0]].astype(str).str.strip()
-        if col1.nunique() > len(df) * 0.5:
+        if col1.nunique() > len(df) * 0.4:
             return "key_value"
 
     if header_found:
@@ -186,14 +194,14 @@ def _read_sheet_frames(file_path: str, ext: str) -> Dict[str, pd.DataFrame]:
 def _find_header_index(rows: List[List[str]]) -> Optional[int]:
     best_idx: Optional[int] = None
     best_score = 0.0
-    for idx, row in enumerate(rows[:12]):
+    for idx, row in enumerate(rows[:14]):
         if not _looks_like_header(row):
             continue
-        score = _header_score(row)
+        score = _header_score(row, idx)
         if score > best_score:
             best_score = score
             best_idx = idx
-    if best_score < 1.3:
+    if best_score < 1.0:
         return None
     return best_idx
 
@@ -224,7 +232,10 @@ def load_structured_payloads(folder_name: str = "All") -> List[Dict[str, Any]]:
         if not isinstance(payload, dict):
             continue
         if folder_name != "All" and payload.get("folder") != folder_name:
-            continue
+            pf = str(payload.get("folder", "")).lower()
+            fn = folder_name.lower()
+            if not (pf in fn or fn in pf):
+                continue
         cache_key = (payload.get("folder"), payload.get("file_name"))
         payloads.append(payload)
         seen.add(cache_key)
@@ -242,7 +253,10 @@ def load_structured_payloads(folder_name: str = "All") -> List[Dict[str, Any]]:
             if not isinstance(payload, dict):
                 continue
             if folder_name != "All" and payload.get("folder") != folder_name:
-                continue
+                pf = str(payload.get("folder", "")).lower()
+                fn = folder_name.lower()
+                if not (pf in fn or fn in pf):
+                    continue
             cache_key = (payload.get("folder"), payload.get("file_name"))
             if cache_key in seen:
                 continue
@@ -299,10 +313,105 @@ def delete_structured_cache(folder_name: str, file_name: Optional[str] = None) -
     return {"removed_memory": removed_memory, "removed_disk": removed_disk}
 
 
+USE_LLM_FLATTENER = True
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_FLATTEN_MODEL = "qwen2.5:14b"
+
+def _llm_flatten_sheet_to_json(df: pd.DataFrame, sheet_name: str) -> Optional[List[Dict[str, str]]]:
+    """
+    Uses an LLM (Cloud or Local) to take a chaotic, merged-cell Excel sheet
+    and flatten it into a perfect, uniform JSON array of key-value pairs.
+    """
+    if not USE_LLM_FLATTENER or df.empty:
+        return None
+
+    try:
+        import requests
+        csv_data = df.to_csv(index=False)
+        # Limit enormous sheets to prevent memory explosion in the fast prompt
+        if len(csv_data) > 30000:
+            csv_data = csv_data[:30000] + "\n...[TRUNCATED]"
+
+        prompt = f"""You are a master Data Engineer. Below is the raw CSV data of an Excel sheet named '{sheet_name}'.
+The sheet contains merged cells, nested headers, and chaotic structure.
+Your job is to read it, understand the visual layout and hierarchy, and FLATTEN it into a uniform JSON array.
+
+RULES:
+1. Output ONLY valid JSON starting with `[` and ending with `]`. No markdown tags like ```json.
+2. Each object in the array should represent a distinct fact or row constraint.
+3. Determine the correct 'Entity' (e.g. Employee, Dependant, etc.) and 'Category' (e.g. Outpatient, Inpatient) and group them properly as keys.
+4. DO NOT output any text outside of the JSON array.
+5. If the table is empty or garbage, return [].
+
+RAW CSV DATA:
+{csv_data}
+"""
+        print(f"      [LLM-FLATTEN] Calling {OLLAMA_FLATTEN_MODEL} to flatten sheet '{sheet_name}'...")
+        payload = {
+            "model": OLLAMA_FLATTEN_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.0}
+        }
+        resp = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload, timeout=120)
+        if resp.status_code == 200:
+            raw_text = resp.json().get("response", "").strip()
+            # Clean up markdown if model outputs it
+            if raw_text.startswith("```json"):
+                raw_text = raw_text[7:]
+            if raw_text.startswith("```"):
+                raw_text = raw_text[3:]
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3]
+            try:
+                parsed = json.loads(raw_text.strip())
+                if isinstance(parsed, list):
+                    print(f"      [LLM-FLATTEN] Success! Extracted {len(parsed)} clean records.")
+                    return parsed
+            except Exception as e:
+                print(f"      [LLM-FLATTEN] JSON Parse Error: {e}")
+                return None
+    except Exception as e:
+        print(f"      [LLM-FLATTEN] Connection/Timeout Error: {e}")
+        return None
+    return None
+
+
+
+def _df_to_markdown_table(df: pd.DataFrame) -> str:
+    if df.empty: return ""
+    # Safe markdown table generation without relying on tabulate
+    headers = " | ".join(str(c).replace("\n", " ").replace("|", "-") for c in df.columns)
+    separator = " | ".join("---" for _ in df.columns)
+    rows = []
+    # Truncate to max 500 rows to avoid blowing up context purely for table-QA
+    for _, row in df.head(500).iterrows():
+        rows.append(" | ".join(str(v).replace("\n", " ").replace("|", "-") for v in row.values))
+    return f"| {headers} |\n| {separator} |\n" + "\n".join(f"| {r} |" for r in rows)
+
 def _parse_sheet(df: pd.DataFrame, sheet_name: str) -> Dict[str, Any]:
     rows = [[_clean_cell(v) for v in row] for row in df.values.tolist()]
     layout = _detect_layout(df)
+    
+    # NEW FAST STRATEGY: Directly cache the Markdown representation of the table
+    # This bypasses the 15-minute Python-LLM execution delay during ingestion.
+    sheet_markdown = _df_to_markdown_table(df)
+
     header_idx = _find_header_index(rows)
+
+    # Basic raw rows extraction (we always keep this so Vector search has backup context)
+    raw_rows: List[Dict[str, Any]] = []
+    for idx, row in enumerate(rows):
+        non_empty = _non_empty_values(row)
+        if non_empty:
+            values = {f"col_{i + 1}": row[i] for i in range(len(row)) if row[i]}
+            raw_rows.append({
+                "row_id": f"{_to_snake_case(sheet_name)}_raw_{idx}",
+                "row_index": idx,
+                "section": "",
+                "values": values,
+                "raw_values": non_empty,
+            })
 
     headers: List[str] = []
     records: List[Dict[str, Any]] = []
@@ -310,19 +419,40 @@ def _parse_sheet(df: pd.DataFrame, sheet_name: str) -> Dict[str, Any]:
     raw_rows: List[Dict[str, Any]] = []
     data: List[Dict[str, str]] = []
     current_section = "General"
+    prev_label: str = ""  # Fix 2: carry-forward label for orphan rows
 
     if header_idx is not None:
-        headers = _dedupe_headers(rows[header_idx])
+        raw_header = rows[header_idx]
+        # Check if rows immediately above also look like headers (multi-line header support)
+        final_headers = list(raw_header)
+        for prev_idx in range(max(0, header_idx - 2), header_idx):
+            prev_row = rows[prev_idx]
+            if _looks_like_header(prev_row) or any("plan" in str(c).lower() for c in prev_row):
+                for i in range(min(len(prev_row), len(final_headers))):
+                    if prev_row[i] and prev_row[i] != final_headers[i]:
+                        final_headers[i] = f"{prev_row[i]} {final_headers[i]}".strip()
+        
+        headers = _dedupe_headers(final_headers)
         start_idx = header_idx + 1
     else:
         start_idx = 0
 
     # Preserve every non-empty row for fallback retrieval on unknown layouts.
+    # Use actual header names if available; fall back to col_1, col_2 generic names.
     for idx, row in enumerate(rows):
         non_empty = _non_empty_values(row)
         if not non_empty:
             continue
-        values = {f"col_{i + 1}": row[i] for i in range(len(row)) if row[i]}
+        if headers:
+            # Use real header names from detected header row
+            values = {}
+            for i, cell in enumerate(row):
+                if not cell:
+                    continue
+                key = headers[i] if i < len(headers) else f"col_{i + 1}"
+                values[key] = cell
+        else:
+            values = {f"col_{i + 1}": row[i] for i in range(len(row)) if row[i]}
         raw_rows.append(
             {
                 "row_id": f"{_to_snake_case(sheet_name)}_raw_{idx}",
@@ -339,9 +469,18 @@ def _parse_sheet(df: pd.DataFrame, sheet_name: str) -> Dict[str, Any]:
         if not non_empty:
             continue
 
-        # Section marker rows help preserve hierarchy.
+        # Fix 1: Section marker detection - only treat as section if it looks like a label,
+        # NOT if it looks like a monetary value or a general data value.
         if len(non_empty) == 1 and len(non_empty[0]) > 1:
-            current_section = non_empty[0]
+            candidate = non_empty[0]
+            # Reject values that look like amounts, percentages, yes/no etc.
+            is_value_like = bool(
+                re.match(r'^[\dRMrm\s,\.%\+\-/]+$', candidate)  # numeric/monetary
+                or re.match(r'^(yes|no|covered|not covered|n/a|nil|\-|tbc)$', candidate, re.I)
+                or re.search(r'as charged|below rm|above rm|per annum|per visit', candidate, re.I)
+            )
+            if not is_value_like:
+                current_section = candidate
             continue
 
         values: Dict[str, str] = {}
@@ -353,6 +492,15 @@ def _parse_sheet(df: pd.DataFrame, sheet_name: str) -> Dict[str, Any]:
             else:
                 key = f"col_{col_idx + 1}"
             values[key] = cell
+
+        # Fix 2: Carry-forward label for orphan single-value rows.
+        # When a row has only the right-side value (col_2), synthesize col_1 from previous row.
+        col_1_key = headers[0] if headers else "col_1"
+        if col_1_key not in values and len(non_empty) == 1:
+            if prev_label:
+                values[col_1_key] = prev_label
+        elif col_1_key in values:
+            prev_label = values[col_1_key]  # remember for next orphan row
 
         if not values:
             continue
@@ -377,6 +525,33 @@ def _parse_sheet(df: pd.DataFrame, sheet_name: str) -> Dict[str, Any]:
                 }
             )
 
+    # Fix 3: Empty sheet fallback - if no records parsed, dump all cells as raw key-values.
+    # This handles cover-page sheets, intro sheets, or unusual layouts.
+    if not records and not raw_rows:
+        for idx, row in enumerate(rows):
+            non_empty = _non_empty_values(row)
+            if not non_empty:
+                continue
+            # Treat 2-column rows as key-value pairs
+            if len(non_empty) >= 2:
+                records.append({
+                    "row_id": f"{_to_snake_case(sheet_name)}_fb_{idx}",
+                    "row_index": idx,
+                    "section": "Fallback",
+                    "values": {"label": non_empty[0], "value": non_empty[1]},
+                    "raw_values": non_empty,
+                })
+                key_values.append({"row_index": idx, "section": "Fallback", "key": non_empty[0], "value": non_empty[1]})
+            else:
+                # Single-cell rows: store as standalone label
+                records.append({
+                    "row_id": f"{_to_snake_case(sheet_name)}_fb_{idx}",
+                    "row_index": idx,
+                    "section": "Fallback",
+                    "values": {"label": non_empty[0]},
+                    "raw_values": non_empty,
+                })
+
     return {
         "layout": layout,
         "header_row_index": header_idx,
@@ -385,6 +560,7 @@ def _parse_sheet(df: pd.DataFrame, sheet_name: str) -> Dict[str, Any]:
         "raw_rows": raw_rows,
         "key_values": key_values,
         "data": data,  # Backward-compatible flat records
+        "markdown": sheet_markdown, # NEW: The fast-tracked Table-QA string
         "total_records": len(records),
         "total_raw_rows": len(raw_rows),
     }

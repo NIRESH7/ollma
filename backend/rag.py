@@ -21,27 +21,43 @@ from database import get_qdrant_client
 from embeddings_provider import get_embeddings
 from excel_ingestion import load_structured_payloads
 from excel_query import is_numeric_question, run_dataframe_query
+from excel_agent import agentic_excel_query
 
 # ── Configuration ──────────────────────────────────────────────────
 COLLECTION_NAME = "local_documents"
-OLLAMA_MODEL = "qwen2:1.5b"
+OLLAMA_MODEL = "qwen2.5:14b"  # Primary model — best local accuracy
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # ── Model Singletons ───────────────────────────────────────────────
+MODEL_PRIORITY = [
+    "qwen2.5:14b",
+    "qwen2.5:7b",
+    "qwen3:8b",
+    "qwen3:4b",
+    "llama3:8b",
+    "llama3:70b",
+    "mistral",
+]
+
 def _get_best_model():
     try:
         import requests
         resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=2)
         if resp.status_code == 200:
-            models = [m["name"] for m in resp.json().get("models", [])]
-            if OLLAMA_MODEL in models:
-                return OLLAMA_MODEL
-            # Find any suitable fallback model
-            for m in models:
-                if "qwen" in m or "llama3" in m or "llama2" in m or "mistral" in m:
+            installed = [m["name"] for m in resp.json().get("models", [])]
+            # Pick the highest-priority installed model
+            for preferred in MODEL_PRIORITY:
+                for installed_m in installed:
+                    if installed_m.startswith(preferred.split(":")[0]) and ":" in preferred and preferred in installed_m:
+                        return installed_m
+                    if installed_m == preferred:
+                        return installed_m
+            # Fallback: any chat model
+            for m in installed:
+                if any(k in m for k in ["qwen", "llama", "mistral", "phi"]):
                     return m
-            if models:
-                return models[0]
+            if installed:
+                return installed[0]
     except Exception:
         pass
     return OLLAMA_MODEL
@@ -85,16 +101,38 @@ ENTITY_HINTS = {
 
 
 def _tokenize(text: str) -> List[str]:
-    tokens = re.split(r"[\W_]+", (text or "").lower())
+    text = (text or "").lower()
+    # Collapse single-letter spaced words (e.g. "R O O M" → "room")
+    text = re.sub(r"(?<=\b[a-z]) (?=[a-z]\b)", "", text)
+    # Generic synonyms only (domain-agnostic)
+    text = re.sub(r"\b(limitation|cap|maximum)\b", "limit", text)
+    text = re.sub(r"\b(amt|value|sum)\b", "amount", text)
+    text = re.sub(r"\b(headcount|qty|no\s+of)\b", "count", text)
+    text = re.sub(r"\b(charges?|fee|cost|price)\b", "charge", text)
+    tokens = re.split(r"[\W_]+", text)
     return [t for t in tokens if len(t) > 1 or t.isdigit()]
 
 
 def _value_match_score(question_tokens: List[str], text: str) -> float:
     blob = (text or "").lower()
+    blob = re.sub(r"(?<=\b[a-z]) (?=[a-z]\b)", "", blob)
+    blob_tokens = re.split(r"[\W_]+", blob)
+    
     score = 0.0
+    stopwords = {"is", "the", "for", "and", "but", "what", "how", "give", "me"}
     for token in question_tokens:
-        if token in blob:
+        if token in stopwords:
+            continue
+        if token in blob_tokens:
             score += 2.0 if len(token) >= 5 else 1.0
+        elif len(token) > 4 and token in blob:
+            score += 1.0
+        elif any(c.isdigit() for c in token):
+            if token in blob_tokens:
+                score += 2.5
+            elif len(token) > 3 and token in blob:
+                # Only allow substring match for longer alphanumeric tokens (like "plan1")
+                score += 1.0
         elif len(token) > 3:
             # Add fuzzy matching for spelling mistakes
             for word in re.split(r"[\W_]+", blob):
@@ -143,12 +181,14 @@ def _column_intent_boost(column: str, intents: List[str]) -> float:
 def _column_specificity_bonus(target_tokens: List[str], col_tokens: set) -> float:
     bonus = 0.0
     overlap = len(set(target_tokens).intersection(col_tokens))
-    bonus += overlap * 0.7
+    bonus += overlap * 2.5
 
     if "inpatient" in target_tokens:
         bonus += 1.8 if "inpatient" in col_tokens else -0.9
     if "outpatient" in target_tokens:
         bonus += 1.8 if "outpatient" in col_tokens else -0.9
+    if "room" in target_tokens and "board" in target_tokens:
+        bonus += 3.0 if "room" in col_tokens or "board" in col_tokens else -2.0
     if any(t in target_tokens for t in ["head", "headcount", "count", "employee"]):
         if any(t in col_tokens for t in ["headcount", "count", "no", "number"]):
             bonus += 1.0
@@ -217,6 +257,11 @@ def _choose_answer_column(
     return best_col, best_score
 
 
+# Source column preference: prefer columns with 'eastspring' in name, downrank 'pamb'
+_SOURCE_PREFER = re.compile(r'eastspring', re.I)
+_SOURCE_DOWNRANK = re.compile(r'pamb', re.I)
+
+
 def _rank_answer_columns(
     columns: List[str], full_question: str, target_part: str, filter_part: str, intents: List[str]
 ) -> List[Tuple[str, float]]:
@@ -246,13 +291,27 @@ def _row_constraint_score(
 ) -> float:
     score = 0.0
     token_set = set(constraint_tokens)
+    seen_texts = set()
+
+    # Mutual-exclusion groups: if question asks for one, penalize rows containing another
+    _EXCLUSION_GROUPS = [
+        {"employee", "staff", "emp"},
+        {"family", "dependent", "spouse", "children"},
+        {"plan 1", "plan1"},
+        {"plan 2", "plan2"},
+        {"plan 3", "plan3"},
+        {"plan 4", "plan4"},
+        {"plan 5", "plan5"},
+        {"plan 6", "plan6"},
+    ]
 
     for col, val in values.items():
         if col == answer_col:
             continue
         text = str(val).strip().lower()
-        if not text:
+        if not text or text in seen_texts:
             continue
+        seen_texts.add(text)
 
         if len(text) > 2 and text in question_norm:
             score += 2.5
@@ -263,6 +322,20 @@ def _row_constraint_score(
         if overlap:
             score += float(overlap)
 
+    # Apply conflict penalty: if a row cell matches a conflicting group label
+    for group in _EXCLUSION_GROUPS:
+        q_hit = any(g in question_norm for g in group)
+        if not q_hit:
+            continue
+        # Check if any cell in this row is a member of a DIFFERENT group
+        for col, val in values.items():
+            text = str(val).strip().lower()
+            for other_g in group:
+                if other_g in question_norm:
+                    continue  # this is the asked one, skip
+                if other_g in text:
+                    score -= 2.5  # penalize: row is for a different entity
+
     return score
 
 
@@ -271,7 +344,7 @@ def _format_multi_sheet_answers(candidates: List[Dict[str, Any]]) -> Optional[st
         return None
     candidates.sort(key=lambda x: x["score"], reverse=True)
     top_score = candidates[0]["score"]
-    best_candidates = [c for c in candidates if c["score"] >= top_score - 1.5]
+    best_candidates = [c for c in candidates if c["score"] >= top_score - 0.1]
     seen = set()
     deduped = []
     for c in best_candidates:
@@ -285,30 +358,70 @@ def _format_multi_sheet_answers(candidates: List[Dict[str, Any]]) -> Optional[st
         return None
     if len(deduped) == 1:
         return str(deduped[0]["value"])
-    all_values = {str(c["value"]).strip().lower() for c in deduped}
+
+    # Filter out placeholder values first
+    real_vals = [c for c in deduped if not _is_placeholder(str(c.get("value", "")))]
+    if not real_vals:
+        return None
+    if len(real_vals) == 1:
+        return str(real_vals[0]["value"])
+
+    # Prefer values from 'eastspring' source columns over 'pamb' when both present
+    eastspring_vals = [c for c in real_vals if "eastspring" in str(c.get("sheet_name") or "").lower() 
+                       or "eastspring" in str(c.get("field_key") or "").lower()]
+    pamb_vals = [c for c in real_vals if "pamb" in str(c.get("field_key") or "").lower()]
+
+    # Build unique value list — prefer Eastspring source
+    all_values = []
+    for c in real_vals:
+        val = str(c["value"]).strip()
+        if val not in all_values and not _is_placeholder(val):
+            all_values.append(val)
+
+    if len(all_values) == 0:
+        return None
     if len(all_values) == 1:
-        return str(deduped[0]["value"])
-    sheet_groups = {}
-    for c in deduped:
-        sheet_groups.setdefault(c["sheet_name"], []).append(str(c["value"]))
-    lines = []
-    for sheet, vals in sheet_groups.items():
-        unique_vals = list(dict.fromkeys(vals))
-        lines.append(f"[{sheet}] " + " | ".join(unique_vals))
-    return "\n".join(lines)
+        return all_values[0]
+
+    # Cap at 2 values to avoid returning noise. If more than 2, take highest-scoring pair.
+    return " | ".join(all_values[:2])
 
 
 def _extract_sheet_name(question: str, folder_name: str) -> Optional[str]:
     q_norm = question.lower()
+    q_tokens = set(_tokenize(q_norm))
+    print(f"DEBUG: _extract_sheet_name q_tokens={q_tokens}")
     payloads = load_structured_payloads(folder_name=folder_name)
+    
     best_sheet = None
-    best_len = 0
+    best_score = 0.0
+    
     for payload in payloads:
         for sheet_name in payload.get("sheets", {}).keys():
             s_norm = sheet_name.lower()
-            if s_norm in q_norm and len(s_norm) > best_len and len(s_norm) > 3:
-                best_len = len(s_norm)
+            
+            # 1. Exact substring match
+            if s_norm in q_norm and len(s_norm) > 3:
+                if len(s_norm) > (len(best_sheet or "")):
+                    best_sheet = sheet_name
+                    best_score = 1.0
+                continue
+                
+            # 2. Fuzzy token overlap
+            s_tokens = set(_tokenize(s_norm))
+            if not s_tokens:
+                continue
+                
+            overlap = len(q_tokens.intersection(s_tokens))
+            score = overlap / len(s_tokens)
+            print(f"DEBUG: sheet='{sheet_name}', s_tokens={s_tokens}, score={score}")
+            
+            # Require at least 70% of the sheet name's tokens to be in the question
+            if score >= 0.70 and score > best_score:
+                best_score = score
                 best_sheet = sheet_name
+
+    print(f"DEBUG: best_sheet returned={best_sheet}")
     return best_sheet
 
 
@@ -347,6 +460,7 @@ def _tabular_row_lookup(question: str, folder_name: str, target_sheet: Optional[
                 filter_part=filter_part,
                 intents=intents,
             )
+            print(f"DEBUG: ranked_columns for sheet {sheet_name} = {ranked_columns}")
             if not ranked_columns:
                 continue
 
@@ -360,8 +474,8 @@ def _tabular_row_lookup(question: str, folder_name: str, target_sheet: Optional[
                 if constraint_tokens and row_score < 1.0:
                     continue
 
-                for answer_col, answer_col_score in ranked_columns[:6]:
-                    if answer_col_score < 0.45:
+                for answer_col, answer_col_score in ranked_columns[:4]:
+                    if answer_col_score < 1.0:
                         continue
 
                     answer_val = str(values.get(answer_col, "")).strip()
@@ -381,6 +495,8 @@ def _tabular_row_lookup(question: str, folder_name: str, target_sheet: Optional[
                             total_score += 1.2
                         else:
                             total_score -= 2.0
+
+                    print(f"DEBUG: evaluated col {answer_col}: val={answer_val}, row_score={row_score}, score={total_score}")
 
                     if intents and filter_part and answer_val.lower() in filter_part and len(answer_val.split()) <= 3:
                         total_score -= 1.5
@@ -404,10 +520,9 @@ def _field_score(question_norm: str, question_tokens: List[str], key: str) -> fl
     if not key_tokens:
         return 0.0
 
-    overlap = len(set(question_tokens) & set(key_tokens)) / len(set(key_tokens))
-    fuzzy = SequenceMatcher(None, question_norm, key_label).ratio()
+    overlap = len(set(question_tokens).intersection(set(key_tokens))) / len(set(key_tokens))
     contains = 1.0 if any(kt in question_norm for kt in key_tokens) else 0.0
-    return max(fuzzy, overlap + (0.2 * contains))
+    return overlap + (0.2 * contains)
 
 
 def _choose_best_field(
@@ -501,6 +616,13 @@ def _matrix_lookup(question: str, folder_name: str, target_sheet: Optional[str] 
             # 1) Find the best matching entity cell and capture its column key.
             best_entity_col = None
             best_entity_score = 0.0
+            
+            for col_key in headers[1:]:
+                header_score = _value_match_score(q_tokens, col_key.replace("_", " "))
+                if header_score > best_entity_score:
+                    best_entity_score = header_score
+                    best_entity_col = col_key
+
             for record in records:
                 values = record.get("values", {})
                 for col_key, col_val in values.items():
@@ -516,7 +638,7 @@ def _matrix_lookup(question: str, folder_name: str, target_sheet: Optional[str] 
 
             # 2) If question asks for the first-column label itself (e.g. PMCare plan code),
             # the answer is often the value in the first column for the matched entity row!
-            if _field_score(q_norm, q_tokens, first_col_key) >= 0.45:
+            if _field_score(q_norm, q_tokens, first_col_key) >= 0.70:
                 # Find the value in first_col_key for the row where best_entity_col matched best
                 for record in records:
                     vals = record.get("values", {})
@@ -531,14 +653,21 @@ def _matrix_lookup(question: str, folder_name: str, target_sheet: Optional[str] 
                             })
                             break
 
-            # 3) Otherwise, find row whose first-column label matches requested field.
+            # 3) Find row whose first-column label matches the entity/filter in question.
+            # For plan+entity queries (e.g. "Employee OP for PLAN 1"), only accept strict row match.
             best_row_value = None
             best_row_score = 0.0
+            _plan_entity_q = bool(re.search(r'\bplan\s*\d+\b', q_norm)) and any(
+                e in q_norm for e in ["employee", "family", "dependent", "spouse", "staff"]
+            )
             for record in records:
                 values = record.get("values", {})
                 row_label = str(values.get(first_col_key, ""))
                 row_score = _value_match_score(q_tokens, row_label)
                 if row_score <= 0:
+                    continue
+                # Strict match for plan+entity questions: row label must be in the question
+                if _plan_entity_q and row_label.strip().lower() not in q_norm:
                     continue
                 candidate_val = values.get(best_entity_col)
                 if candidate_val is None or str(candidate_val).strip() == "":
@@ -556,7 +685,7 @@ def _matrix_lookup(question: str, folder_name: str, target_sheet: Optional[str] 
 
             # Raw matrix fallback for sheets where structured headers are ambiguous.
             raw_rows = sheet_data.get("raw_rows", [])
-            if raw_rows and re.search(r"\b(plan code|pmcare)\b", q_norm):
+            if raw_rows and re.search(r"\b(plan code|pmcare|coverage|limit|room|board|headcount|count)\b", q_norm):
                 # Build ordered row cells from col_1..col_n keys.
                 ordered_rows: List[List[str]] = []
                 for raw in raw_rows:
@@ -622,11 +751,37 @@ def _iter_structured_records(folder_name: str, target_sheet: Optional[str] = Non
                     yield file_name, sheet_name, raw_record
 
 
+# Values that are placeholder/incomplete — should never be returned as answers
+_PLACEHOLDER_PATTERNS = re.compile(
+    r'^(please\s+(confirm|advise|check|revert)|to\s+be\s+(confirm(ed)?|advise?d?)|tba|tbc|n/a|na|'  
+    r'covered\s*/\s*not\s+covered|cover\s*/\s*not\s+covered|yes/no|yes\s*/\s*no|refer\s+ghs|'  
+    r'please\s+let\s+us|if\s+any|no\s+number).*$',
+    re.IGNORECASE
+)
+
+def _is_placeholder(value: str) -> bool:
+    """Return True if the value is a placeholder that should not be returned as an answer."""
+    v = (value or "").strip()
+    return bool(_PLACEHOLDER_PATTERNS.match(v))
+
+
 def _suspicious_direct_answer(question: str, answer: str) -> bool:
     q = (question or "").lower()
     a = (answer or "").strip().lower()
     if not a:
         return True
+
+    # Filter out placeholder-style answers
+    if _is_placeholder(answer):
+        return True
+
+    # Reject concatenated headers masquerading as answers
+    if "|" in a and not re.search(r"(\d|rm|RM)", answer) and "as charged" not in a:
+        return True
+
+    # Detect plan+entity matrix questions (e.g. "Employee OP limit for PLAN 1")
+    # These need precise matrix lookup — single numbers from structured lookup are unreliable
+    # NOTE: Do NOT route to agentic here — it's too slow (100s+). Matrix lookup handles it.
 
     intents = _detect_intents(q)
     if not intents:
@@ -668,7 +823,7 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _collect_structured_candidates(question: str, folder_name: str, limit: int = 60) -> List[str]:
+def _collect_structured_candidates(question: str, folder_name: str, limit: int = 200) -> List[str]:
     q_tokens = _tokenize(question)
     scored: List[Tuple[float, str]] = []
 
@@ -676,13 +831,27 @@ def _collect_structured_candidates(question: str, folder_name: str, limit: int =
     for payload in payloads:
         file_name = payload.get("file_name", "")
         for sheet_name, sheet_data in payload.get("sheets", {}).items():
+            # Mandatory header context for sheets
+            headers = sheet_data.get("headers", [])
+            if headers:
+                h_text = "COLUMNS: " + " | ".join(headers)
+                scored.append((5.0, f"File: {file_name} | Sheet: {sheet_name} | {h_text}"))
+            
+            # Include top raw rows (pivots/headers) regardless of score to help LLM orientation
+            raw_rows = sheet_data.get("raw_rows", [])
+            for record in raw_rows[:5]:
+                values = record.get("values", {})
+                row_text = " | ".join([f"{v}" for v in values.values()])
+                scored.append((4.0, f"File: {file_name} | Sheet: {sheet_name} | HEADER_ROW: {row_text}"))
+
             for row_bucket in ("records", "raw_rows"):
                 for record in sheet_data.get(row_bucket, []):
                     values = record.get("values", {})
                     if not isinstance(values, dict) or not values:
                         continue
                     row_text = " | ".join([f"{k}: {v}" for k, v in values.items()])
-                    context = f"File: {file_name} | Sheet: {sheet_name} | {row_text}"
+                    section = record.get("section", "General")
+                    context = f"File: {file_name} | Sheet: {sheet_name} | Section: {section} | {row_text}"
                     score = _value_match_score(q_tokens, context)
                     if score > 0:
                         scored.append((score, context))
@@ -698,7 +867,7 @@ def _collect_structured_candidates(question: str, folder_name: str, limit: int =
             continue
         seen.add(context)
         unique_contexts.append(context)
-        if len(unique_contexts) >= limit:
+        if len(unique_contexts) >= 120:
             break
     return unique_contexts
 
@@ -794,9 +963,10 @@ Do not rely on external knowledge. Do not fabricate missing information.
 ------------------------------------------------
 OUTPUT FORMAT
 Return STRICT JSON with the following keys:
-- "answer": concise exact value string. If the answer comes from a specific sheet, include the sheet name in brackets (e.g., "[Sheet Name] value"). If multiple results exist, list them clearly separated by newlines. If not found, use exactly "The requested information is not available in the provided spreadsheet data."
-- "evidence": exact row text you used.
-- "confidence": number from 0 to 1.
+- "answer": concise exact value string from the data. If the answer comes from specific cell coordinates or rows, mention them if helpful. Format: "[Sheet Name] Value". If not found, use exactly "The requested information is not available in the provided spreadsheet data."
+- "evidence": The exact raw row text or data snippet you found.
+- "confidence": A score from 0.0 to 1.0 reflecting how certainly the data answers the specific question.
+- "reasoning": A 1-sentence explanation of why you picked this data.
 
 JSON FORMAT ONLY.
 
@@ -828,13 +998,20 @@ JSON:"""
     if not answer or answer.lower() == "data not available":
         return None
 
-    # Guardrails: answer should appear in evidence/context and confidence should be decent.
+    # Fix 4: Relaxed guardrails for production robustness
+    # - Allow partial answer match in context (not exact)
+    # - Lower confidence threshold to 0.40
     normalized_context = "\n".join(candidates).lower()
-    if answer.lower() not in normalized_context:
+    answer_words = [w for w in answer.lower().split() if len(w) > 2]
+    context_hit = any(w in normalized_context for w in answer_words) if answer_words else True
+    if not context_hit:
         return None
-    if evidence and answer.lower() not in evidence.lower():
-        return None
-    if confidence < 0.55:
+    # Relax evidence check: allow partial match
+    if evidence:
+        evidence_words = [w for w in answer.lower().split() if len(w) > 2]
+        if evidence_words and not any(w in evidence.lower() for w in evidence_words):
+            return None
+    if confidence < 0.40:
         return None
 
     return answer
@@ -853,17 +1030,22 @@ def _structured_lookup(question: str, folder_name: str, target_sheet: Optional[s
     intents = _detect_intents(question_norm)
 
     # Matrix lookup handles cross-column mapping questions like plan code by category.
-    if "plan_code" in intents:
-        matrix_cands = _matrix_lookup(question, folder_name, target_sheet)
+    matrix_cands = _matrix_lookup(question, folder_name, target_sheet)
+    if matrix_cands:
+        matrix_cands = [c for c in matrix_cands if not _suspicious_direct_answer(question, str(c.get("value", "")))]
         if matrix_cands:
             ans = _format_multi_sheet_answers(matrix_cands)
             if ans: return ans
 
     # Tabular row lookup handles "for group X plan Y give me headcount" queries.
     table_cands = _tabular_row_lookup(question, folder_name, target_sheet)
+    # print(f"DEBUG: table_cands={table_cands}")
     if table_cands:
-        ans = _format_multi_sheet_answers(table_cands)
-        if ans: return ans
+        table_cands = [c for c in table_cands if not _suspicious_direct_answer(question, str(c.get("value", "")))]
+        if table_cands:
+            ans = _format_multi_sheet_answers(table_cands)
+            print(f"DEBUG: ans={ans}")
+            if ans: return ans
 
     filter_part, target_part = _split_question_parts(question_norm)
     scoring_text = target_part or question_norm
@@ -903,7 +1085,12 @@ def _structured_lookup(question: str, folder_name: str, target_sheet: Optional[s
 
     if not candidates:
         mc = _matrix_lookup(question, folder_name, target_sheet)
-        return _format_multi_sheet_answers(mc) if mc else None
+        if mc:
+            mc = [c for c in mc if not _suspicious_direct_answer(question, str(c.get("value", "")))]
+            if mc:
+                ans = _format_multi_sheet_answers(mc)
+                if ans: return ans
+        return None
 
     # Sort and filter fallbacks
     candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -914,7 +1101,7 @@ def _structured_lookup(question: str, folder_name: str, target_sheet: Optional[s
         return None
 
     # Build final formatted return similarly to previous simple logic but allowing multiple sheets if they tied
-    high_scoring = [c for c in candidates if c["score"] >= best_candidate["score"] - 1.0 and c["row_score"] >= 2.0]
+    high_scoring = [c for c in candidates if c["score"] >= best_candidate["score"] - 0.1 and c["row_score"] >= 2.0]
     
     extracted_vals = []
     for cd in high_scoring:
@@ -947,15 +1134,24 @@ def _structured_lookup(question: str, folder_name: str, target_sheet: Optional[s
             extracted_vals.append({
                 "sheet_name": cd["sheet_name"],
                 "value": val,
-                "score": cd["score"]
+                "score": cd["score"],
+                "field_key": cd.get("field_key", ""),  # needed for source preference
             })
 
     if extracted_vals:
-        return _format_multi_sheet_answers(extracted_vals)
+        extracted_vals = [c for c in extracted_vals if not _suspicious_direct_answer(question, str(c.get("value", "")))]
+        if extracted_vals:
+            ans = _format_multi_sheet_answers(extracted_vals)
+            if ans: return ans
 
     # Cross-row matrix fallback.
     mc = _matrix_lookup(question, folder_name, target_sheet)
-    return _format_multi_sheet_answers(mc) if mc else None
+    if mc:
+        mc = [c for c in mc if not _suspicious_direct_answer(question, str(c.get("value", "")))]
+        if mc:
+            ans = _format_multi_sheet_answers(mc)
+            if ans: return ans
+    return None
 
 
 def _answer_from_vector_metadata(question: str, docs: List[Any]) -> Optional[str]:
@@ -991,13 +1187,56 @@ def _answer_from_vector_metadata(question: str, docs: List[Any]) -> Optional[str
     return best_value
 
 
-# ── Query Entry ────────────────────────────────────────────────────
+# ── Spell Correction Helpers ───────────────────────────────────────
+def _build_vocab_from_payloads(folder_name: str) -> set:
+    """Build a vocabulary of known words from all ingested data for this folder."""
+    vocab = set()
+    payloads = load_structured_payloads(folder_name=folder_name)
+    for payload in payloads:
+        for sheet_name, sheet_data in payload.get("sheets", {}).items():
+            vocab.update(_tokenize(sheet_name))
+            for record in sheet_data.get("records", []) + sheet_data.get("raw_rows", []):
+                for v in record.get("values", {}).values():
+                    vocab.update(_tokenize(str(v)))
+            for h in (sheet_data.get("headers") or []):
+                vocab.update(_tokenize(h))
+    # Remove very short/generic tokens
+    return {w for w in vocab if len(w) > 3}
+
+
+def _fuzzy_correct_question(question: str, folder_name: str) -> str:
+    """Correct spelling mistakes in the question using known vocab from data."""
+    from difflib import get_close_matches
+    vocab = _build_vocab_from_payloads(folder_name)
+    if not vocab:
+        return question
+    vocab_list = list(vocab)
+    tokens = re.split(r"([\W_]+)", question)  # preserve separators
+    corrected = []
+    for token in tokens:
+        word = token.strip().lower()
+        # Only try to correct alpha words of decent length
+        if len(word) >= 4 and word.isalpha() and word not in vocab:
+            matches = get_close_matches(word, vocab_list, n=1, cutoff=0.80)
+            if matches:
+                # Preserve original casing style
+                corrected.append(matches[0])
+                continue
+        corrected.append(token)
+    result = "".join(corrected)
+    if result != question:
+        print(f"LOG: SPELL_CORRECT | '{question}' → '{result}'")
+    return result
+
+
 def query_rag(question: str, folder_name: str = "All") -> str:
     print(f"\nLOG: QUERY_RECEIVED | {question}")
     _ = time.time()
 
     print("LOG: FLOW | Normalization")
     clean_question = question.replace("garde", "grade").replace("JL12", "JL 12").replace("emp", "employee")
+    # Spell correction: fix typos using vocab from the uploaded data
+    clean_question = _fuzzy_correct_question(clean_question, folder_name)
 
     print("LOG: FLOW | Intent Detection")
     intents = _detect_intents(clean_question)
@@ -1010,19 +1249,24 @@ def query_rag(question: str, folder_name: str = "All") -> str:
     if target_sheet:
         print(f"LOG: SHEET DETECTED | Restricting lookup to sheet: {target_sheet}")
 
-    # STEP 1: Structured deterministic lookup
-    print("LOG: FLOW | JSON Lookup")
-    direct_match = _structured_lookup(clean_question, folder_name, target_sheet)
-    if direct_match:
-        if not _suspicious_direct_answer(clean_question, direct_match):
-            print("LOG: FLOW | Found (Return)")
-            print(f"LOG: FINAL_ANSWER | (Structured) {direct_match}")
-            return direct_match
-        print(f"LOG: STRUCTURED_LOOKUP | Suspicious direct answer ignored: {direct_match}")
+    # STEP 1: Deterministic lookup (DISABLED - User strictly prefers the filtered LLM flow)
+    # direct_match = _structured_lookup(clean_question, folder_name, target_sheet)
+    # if direct_match:
+    #     if not _suspicious_direct_answer(clean_question, direct_match):
+    #         return direct_match
 
-    print("LOG: FLOW | Not Found -> Vector Search / AI")
+    print("LOG: FLOW | Bypassing fragile deterministic lookup -> Using Fast Pruned LLM Table-QA directly")
 
-    # STEP 2: Numeric engine
+    # STEP 2: Agentic Pandas Engine — LLM writes & runs Pandas code on the actual Excel file
+    print("LOG: FLOW | Agentic Markdown Table-QA (qwen2.5:14b reads flat text)")
+    agentic_result = agentic_excel_query(clean_question, folder_name, target_sheet=target_sheet, llm=llm)
+    if agentic_result:
+        if not _suspicious_direct_answer(clean_question, agentic_result):
+            print(f"LOG: FINAL_ANSWER | (Agentic) {agentic_result}")
+            return agentic_result
+        print(f"LOG: AGENTIC | Suspicious answer ignored: {agentic_result}")
+
+    # STEP 3: Numeric math engine
     if is_numeric_question(clean_question):
         print("LOG: FLOW | Math Engine Computation")
         math_result = run_dataframe_query(clean_question, folder_name)
@@ -1030,12 +1274,12 @@ def query_rag(question: str, folder_name: str = "All") -> str:
             print(f"LOG: FINAL_ANSWER | (Math Engine) {math_result}")
             return math_result
 
-    # STEP 2.5: Structured-context LLM fallback (offline, no vector DB required)
-    print("LOG: FLOW | Vector Search (Structured Candidates)")
+    # STEP 4: Universal Analyst Engine (LLM reads structured JSON context)
+    print("LOG: FLOW | Universal Analyst Engine Scanning...")
     llm_structured = _llm_structured_fallback(clean_question, folder_name)
     if llm_structured:
-        print("LOG: FLOW | LLM -> Final Answer")
-        print(f"LOG: FINAL_ANSWER | (LLM Structured) {llm_structured}")
+        print("LOG: FLOW | Universal Engine Found Answer")
+        print(f"LOG: FINAL_ANSWER | (Engine) {llm_structured}")
         return llm_structured
 
     # STEP 3: Vector retrieval
